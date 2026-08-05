@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         FB Marketplace Car Watcher (Edmonton)
 // @namespace    car-scanner
-// @version      0.2.0
-// @description  Rotates a pinned tab through Edmonton car/truck/SUV searches, Telegram-notifies new listings
+// @version      0.3.0
+// @description  Rotates a pinned tab through Edmonton car/truck/SUV searches, posts scraped listings to the droplet scorer
 // @match        https://www.facebook.com/marketplace/*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
 // @grant        GM_xmlhttpRequest
 // @connect      api.telegram.org
+// @connect      YOUR_DROPLET_HOST
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
@@ -39,6 +40,16 @@
   const SEEN_CAP = 2000;                 // FIFO cap on remembered listing IDs
   const WARN_COOLDOWN_MS = 6 * 3600 * 1000;
   const SEND_SPACING_MS = 1100;          // Telegram allows ~1 msg/s per chat
+
+  // Scraped listings are POSTed to the droplet, which runs the rejection
+  // and scoring pipeline and sends any deal alerts itself. Edit the host
+  // here AND in the @connect line above, then set the token via the
+  // Tampermonkey menu ("Set droplet ingest token").
+  const INGEST_URL = "http://YOUR_DROPLET_HOST:8477/ingest";
+  const INGEST_FLUSH_MS = 60 * 1000;
+  const INGEST_BUFFER_CAP = 500;         // oldest dropped past this
+  const INGEST_BATCH_MAX = 200;          // server-side items-per-request cap
+  const INGEST_TIMEOUT_MS = 20 * 1000;
 
   // --------------------------------------------------------------------------
 
@@ -128,6 +139,57 @@
       onerror: (e) => console.warn("[car-watcher] telegram send failed", e),
     });
   }
+
+  // --- droplet ingest bridge ------------------------------------------------
+
+  let ingestInFlight = false;
+
+  function bufferListing(item) {
+    const buf = GM_getValue("ingest_buffer", []);
+    buf.push(item);
+    GM_setValue("ingest_buffer", buf.slice(-INGEST_BUFFER_CAP));
+    flushIngest();
+  }
+
+  function flushIngest() {
+    if (ingestInFlight) return;
+    // Split literal so a global find-replace of the placeholder (the natural
+    // way to configure the host) can't rewrite this guard into matching the
+    // user's real host and silently disabling ingest forever.
+    if (INGEST_URL.includes("YOUR_" + "DROPLET_HOST")) return; // not configured yet
+    const token = GM_getValue("ingest_token", "");
+    if (!token) return;
+    const buf = GM_getValue("ingest_buffer", []);
+    if (buf.length === 0) return;
+    const n = Math.min(buf.length, INGEST_BATCH_MAX);
+    ingestInFlight = true;
+    const done = (ok, why) => {
+      ingestInFlight = false;
+      if (ok) {
+        // splice against a re-read so items scraped mid-flight survive
+        const cur = GM_getValue("ingest_buffer", []);
+        GM_setValue("ingest_buffer", cur.slice(n));
+        if (cur.length > n) flushIngest();
+      } else {
+        console.warn("[car-watcher] ingest", why, "- buffered", buf.length);
+      }
+    };
+    GM_xmlhttpRequest({
+      method: "POST",
+      url: INGEST_URL,
+      timeout: INGEST_TIMEOUT_MS,
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + token,
+      },
+      data: JSON.stringify(buf.slice(0, n)),
+      onload: (resp) => done(resp.status === 200, "HTTP " + resp.status),
+      onerror: () => done(false, "network error"),
+      ontimeout: () => done(false, "timeout"),
+    });
+  }
+
+  // --------------------------------------------------------------------------
 
   function loadSeen() {
     return new Set(GM_getValue("seen_ids", []));
@@ -246,11 +308,12 @@
       seenSet.add(l.id);
       seenArr.push(l.id);
       dirty = true;
-      if (!seeding) {
-        const price = l.price ? "$" + l.price : "price n/a";
-        telegramSend("NEW [facebook/" + search.label + "] " + price + " — " +
-                     l.text + "\n" + l.url);
-      }
+      // The droplet decides what's alert-worthy; seed-pass items are flagged
+      // so it stores them as comp data without ever alerting.
+      bufferListing({
+        id: l.id, url: l.url, price_text: l.price, text: l.text,
+        label: search.label, seen_at: new Date().toISOString(), seed: seeding,
+      });
     }
     if (dirty) saveSeen(seenArr);
     if (seeding) {
@@ -273,9 +336,15 @@
     }, delay);
   }
 
+  function promptForIngestToken() {
+    const token = (prompt("Car watcher: droplet ingest token (INGEST_TOKEN)") || "").trim();
+    GM_setValue("ingest_token", token);
+  }
+
   function main() {
     if (typeof GM_registerMenuCommand === "function") {
       GM_registerMenuCommand("Set Telegram credentials", promptForCreds);
+      GM_registerMenuCommand("Set droplet ingest token", promptForIngestToken);
     }
     // Only a tab sitting on one of the configured searches becomes the
     // watcher; ordinary browsing tabs are left alone (no rotation hijack, no
@@ -296,6 +365,7 @@
     console.log("[car-watcher] active on", search.label);
     tick();
     setInterval(tick, SCRAPE_INTERVAL_MS);
+    setInterval(flushIngest, INGEST_FLUSH_MS);
     scheduleRotateReload();
   }
 

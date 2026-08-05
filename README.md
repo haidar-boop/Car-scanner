@@ -1,26 +1,75 @@
 # Edmonton Car Deal Scanner
 
-Two scrapers, one goal: be first to message the seller on genuinely underpriced
-cars around Edmonton. Precision over recall at every decision point.
+Two scrapers, one scorer, one goal: be first to message the seller on genuinely
+underpriced cars around Edmonton. Precision over recall at every decision point.
 
 - `autotrader_watcher.py` — polls three AutoTrader.ca searches from a droplet,
-  stores every listing in SQLite (`listings.db`), Telegram-notifies new ones.
+  stores every listing in SQLite (`listings.db`), scores them, and Telegram-alerts
+  real deals. Also hosts the ingest endpoint that receives Facebook listings.
+- `scoring.py` — the four-layer scoring engine (see below).
 - `fb_marketplace_watcher.user.js` — Tampermonkey userscript; one pinned tab
   rotates through four Marketplace searches (cars ×2 price bands, trucks, SUVs)
-  on a randomized 5–15 min reload.
+  on a randomized 5–15 min reload and posts what it scrapes to the droplet.
 
-**Status: Step 1 of 5** (search targets locked, baseline watch loop). Deal
-scoring, alert formatting, failure hardening, and the full README arrive in
-Steps 2–5. Note: everything scraped is an **asking** price, not a transaction
-price.
+**Status: Step 2 of 5** (scoring engine live, in shadow mode). Alert formatting,
+failure hardening, and `--test` arrive in Steps 3–5.
+
+**The asking-price caveat, stated plainly:** everything scraped is an **asking**
+price, not a transaction price. The model predicts what a car will be *listed*
+at, not what it is worth — a car asking 20% below the curve may just have a
+realistic seller. The listing-lifespan signal (`disappeared_at`) is the partial
+correction: listings that vanish within ~48 h very likely sold fast.
+
+## The four scoring layers
+
+1. **Rejection** — before anything is measured: price sanity (<$500, placeholder
+   patterns like $1111/$12345, unparseable), a condition blocklist (salvage,
+   rebuilt, flood, no start, as-is, lien, … — editable at the top of
+   `scoring.py`), data completeness (no year/make/model/km → stored but never
+   scored), odometer sanity, and 90-day repost/cross-post fingerprints
+   (family+year+km/5000+price/250). Rejected and damaged rows are also excluded
+   from comp fitting — legitimately cheap cars must not drag the curve down.
+   Every rejection is logged with its reason.
+2. **Price model** — per model family (normalized make+modelGroup):
+   `log(price) = b0 + b1·age + b2·log(km+1)`, fit with generalized Theil-Sen
+   (median over exact solutions of random point-triples — robust to the very
+   outliers being hunted), Huber-IRLS fallback. Refit nightly at 03:00 or after
+   200 new comps per family; scoring is a cached lookup, never a fit. Families
+   under 30 comps fall back to a segment model (their search's price/body band)
+   and alerts get marked **[LOW CONF]**.
+3. **Robust z-score** — `z = (log(price) − predicted) / (1.4826 × MAD)` of the
+   family's residuals. Alerts fire at `z ≤ −2.0` (per source), dealers at
+   `z ≤ −2.5` (their pricing is already market-calibrated). Alerts report both
+   z and percent-below-predicted.
+4. **Confidence gates** — no alert at all when the model can't be trusted:
+   fewer than 8 comps, degenerate or absurd residual spread, the listing's km
+   or age outside the fitted comps' range (no extrapolating depreciation
+   curves), or a fit older than 30 days.
+
+## Shadow mode and the feedback loop
+
+For the first **14 days** after scoring starts, nothing buzzes your phone:
+alerts are recorded silently and a digest of would-have-fired alerts goes out
+at 8 PM nightly (also a pipeline-alive heartbeat). Judge the precision, tune,
+then let it go live.
+
+Label alerts from your phone (via SSH) after checking them:
+
+```sh
+python3 autotrader_watcher.py --label 12 good     # or bad | scam | already_gone
+```
+
+Sunday 6 PM a weekly report lands in Telegram: alerts fired, labeled precision,
+and blocklist-term suggestions mined from bad/scam-labeled listings. Manual
+triggers: `--digest`, `--report`.
 
 ## Install (droplet)
 
 ```sh
-apt update && apt install -y python3-requests python3-bs4
+apt update && apt install -y python3-requests python3-bs4 python3-numpy
 # (Debian 12 / Ubuntu 23.04+ block bare pip3 installs — PEP 668. If you'd
 #  rather use pip, make a venv and point the unit's ExecStart at its python.)
-mkdir -p /opt/car-scanner && cp autotrader_watcher.py /opt/car-scanner/
+mkdir -p /opt/car-scanner && cp autotrader_watcher.py scoring.py /opt/car-scanner/
 cp car-scanner.env.example /etc/car-scanner.env  # fill in real values
 chmod 600 /etc/car-scanner.env
 cp car-scanner.service /etc/systemd/system/
@@ -29,20 +78,52 @@ systemctl daemon-reload && systemctl enable --now car-scanner
 journalctl -u car-scanner -f
 ```
 
+## FB → droplet bridge
+
+FB listings get the same scoring and cross-source dedupe as AutoTrader; the
+droplet decides what alerts. Setup:
+
+1. Generate a token: `openssl rand -hex 24` → set `INGEST_TOKEN` in
+   `/etc/car-scanner.env`, restart the service. (Empty token = ingest disabled;
+   the server never runs unauthenticated.)
+2. Open the port: `ufw allow 8477/tcp` — or better, restrict to your home IP:
+   `ufw allow from YOUR.HOME.IP to any port 8477 proto tcp`.
+3. In the userscript, replace `YOUR_DROPLET_HOST` with your droplet's IP or
+   hostname (a global find-replace is safe), reinstall it, then set the token
+   via Tampermonkey menu → "Set droplet ingest token".
+
+Traffic is plain HTTP; the bearer token is the only protection. The payload is
+public listing data, so the worst case of a sniffed token is fake listings —
+treat the token as disposable, or put an nginx/caddy TLS proxy in front later.
+
+Most FB anchor rows lack a parseable year or km — those are stored unscored
+(`reject_reason='incomplete'`) as future reference data. That is by design:
+a guessed comp is worse than no alert. FB listing lifespans are not tracked
+(the droplet can't fetch FB pages behind the login wall).
+
+## Database
+
+`listings` (every listing ever seen, with `family`, `fingerprint`,
+`reject_reason`, `z`, `pct_below`, `disappeared_at`), `price_history` (every
+observed price), `models` (cached fit coefficients + comp ranges + fitted_at),
+`alerts` (every real or shadow alert with the coefficients frozen at firing
+time, plus your labels), `meta` (seed flags, shadow_until, schedules).
+
 Telegram credentials come from environment variables only
 (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`); with them unset the watcher runs
 and stores listings but only logs what it would have sent.
 
 ## Install (browser)
 
-Install the userscript in Tampermonkey, then pin a tab and open the **first
-URL from `SEARCH_URLS`** in it — the watcher only activates on its own
-configured searches, so ordinary Marketplace browsing in other tabs is left
-untouched (no alerts from recommendation feeds, no surprise redirects). Enter
-the Telegram token/chat ID when prompted (stored in Tampermonkey storage,
-never in the file; change later via the Tampermonkey menu → "Set Telegram
-credentials"). Each search seeds silently on its first clean scan, so neither
-install nor the first rotations flood Telegram.
+Install the userscript in Tampermonkey (after the bridge edits above), then
+pin a tab and open the **first URL from `SEARCH_URLS`** in it — the watcher
+only activates on its own configured searches, so ordinary Marketplace
+browsing in other tabs is left untouched (no alerts from recommendation
+feeds, no surprise redirects). Enter the Telegram token/chat ID when prompted
+(used only for the script's own health warnings; deal alerts come from the
+droplet). Each search seeds silently on its first clean scan, and scraped
+listings are buffered in Tampermonkey storage and retried until the droplet
+accepts them, so nothing is lost across reloads.
 
 **One-time manual check (can't be automated):** open each of the four search
 URLs from the top of the userscript while logged in, and confirm results are
