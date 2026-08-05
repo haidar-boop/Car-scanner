@@ -137,10 +137,12 @@ class _JsonFormatter(logging.Formatter):
         }
         payload.update(getattr(record, "fields", None) or {})
         try:
-            return json.dumps(payload, default=str)
+            # Compact separators so the documented greps ('"event":"reject"')
+            # match, and the file stays smaller.
+            return json.dumps(payload, default=str, separators=(",", ":"))
         except Exception:
             return json.dumps({"ts": payload["ts"], "level": "ERROR",
-                               "event": "log_format_failed"})
+                               "event": "log_format_failed"}, separators=(",", ":"))
 
 
 _logger = None
@@ -943,11 +945,21 @@ def poll_once(conn):
             # drift is config-level breakage and warns on the first sighting.
             record_health(conn, "autotrader", label, ok=bool(rows),
                           reason=None if rows else "zero listings parsed")
-            drift = [p for p in problems if p.startswith("param ")]
-            if drift:
-                warn_search_broken(conn, label, drift)
+            # Every verification problem suppresses this search's alerts, so
+            # every one must be announced — otherwise a search stops alerting
+            # indefinitely while its scan counts still look healthy. The two
+            # empty-page symptoms are the exception: the streak counter above
+            # owns them (warn on the 2nd consecutive miss, not the 1st blip).
+            # Everything else coexists with parsed rows, so the streak can
+            # never catch it and it must warn on sight.
+            notify = [p for p in problems
+                      if not p.startswith("no listings")
+                      and not p.startswith("numberOfResults")]
+            if notify:
+                warn_search_broken(conn, label, notify)
             if problems:
-                log("[%s] search-state problems: %s" % (label, "; ".join(problems)))
+                log("[%s] search-state problems: %s" % (label, "; ".join(problems)),
+                    event="search_problems", search_label=label, problems=problems)
                 # Still assess+score the rows (they'd otherwise sit unassessed
                 # until the next restart's backfill) — just never alert off a
                 # search that failed verification.
@@ -968,7 +980,16 @@ def poll_once(conn):
             # comps, but never alerted on.
             process_new_rows(conn, new_rows, allow_alerts=not seeding)
         except Exception as e:
-            log("[%s] search failed: %s" % (label, e))
+            # A search that raises every cycle would otherwise never reach
+            # record_health below and stay invisible to every alarm.
+            log("[%s] search failed: %s" % (label, e),
+                event="search_exception", search_label=label,
+                error=e.__class__.__name__)
+            try:
+                record_health(conn, "autotrader", label, ok=False,
+                              reason="exception:%s" % e.__class__.__name__)
+            except Exception:
+                pass
     return parsed_counts
 
 
@@ -1011,14 +1032,18 @@ def local_day_start_utc():
 
 
 def send_telegram_chunks(lines, limit=3500):
+    """Returns True only if every chunk was accepted — the caller must not
+    mark the day done when the message never arrived."""
+    ok = True
     chunk = ""
     for line in lines:
         if chunk and len(chunk) + len(line) > limit:
-            telegram_send(chunk.rstrip())
+            ok = telegram_send(chunk.rstrip()) and ok
             chunk = ""
         chunk += line + "\n"
     if chunk.strip():
-        telegram_send(chunk.rstrip())
+        ok = telegram_send(chunk.rstrip()) and ok
+    return ok
 
 
 def send_daily_digest(conn, manual=False):
@@ -1027,7 +1052,13 @@ def send_daily_digest(conn, manual=False):
     During shadow mode this is the only thing that reaches the phone, and it
     goes out even on empty days — silence would be indistinguishable from a
     dead pipeline."""
-    since = local_day_start_utc()
+    # Window from the previous digest, NOT local midnight: the digest fires at
+    # 20:00, so a midnight anchor would drop 20:00-to-midnight into a hole no
+    # digest ever covers — prime private-seller posting hours.
+    since = meta_get(conn, "last_digest_at")
+    floor = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if not since or since < floor:
+        since = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
     scans = conn.execute(
         """SELECT source, search_label, SUM(parsed_count) AS parsed
            FROM scans WHERE scanned_at >= ? GROUP BY source, search_label
@@ -1052,12 +1083,18 @@ def send_daily_digest(conn, manual=False):
         by_reason[key] = by_reason.get(key, 0) + r["n"]
 
     best = conn.execute(
-        """SELECT l.*, EXISTS(SELECT 1 FROM alerts a WHERE a.source=l.source
-                              AND a.listing_id=l.id) AS alerted
+        """SELECT l.*,
+                  EXISTS(SELECT 1 FROM alerts a WHERE a.source=l.source
+                         AND a.listing_id=l.id AND a.shadow=0) AS sent_alert,
+                  EXISTS(SELECT 1 FROM alerts a WHERE a.source=l.source
+                         AND a.listing_id=l.id) AS any_alert
            FROM listings l WHERE l.scored_at >= ? AND l.z IS NOT NULL
            ORDER BY l.z ASC LIMIT 5""", (since,)).fetchall()
 
-    lines = ["📊 DIGEST — %s" % datetime.now(TZ).strftime("%a %d %b")]
+    lines = ["📊 DIGEST — %s (since %s)" % (
+        datetime.now(TZ).strftime("%a %d %b"),
+        datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ")
+                .replace(tzinfo=timezone.utc).astimezone(TZ).strftime("%a %H:%M"))]
     lines.append("Scanned: " + (" · ".join(
         "%s %d" % (src, n) for src, n in sorted(by_source.items())) or "nothing"))
     if scans:
@@ -1076,9 +1113,12 @@ def send_daily_digest(conn, manual=False):
         lines.append("")
         lines.append("Best scores today:")
         for i, b in enumerate(best, 1):
+            # "alerted" must mean it reached the phone; a shadow row did not.
+            mark = ("  ✅ alerted" if b["sent_alert"]
+                    else "  🌒 would have fired" if b["any_alert"] else "")
             lines.append(" %d. z=%.1f · %d%% below · $%s · %s%s" % (
                 i, b["z"], round(b["pct_below"] or 0), format(b["price"], ","),
-                vehicle_line(dict(b)), "  ✅ alerted" if b["alerted"] else ""))
+                vehicle_line(dict(b)), mark))
 
     shadow_until = meta_get(conn, "shadow_until")
     in_shadow = shadow_until and utc_now_iso() < shadow_until
@@ -1101,9 +1141,13 @@ def send_daily_digest(conn, manual=False):
                 marks, a["url"] or ""))
         if not would:
             lines.append("(none crossed the threshold today)")
-    send_telegram_chunks(lines)
+    ok = send_telegram_chunks(lines)
+    if ok:
+        meta_set(conn, "last_digest_at", utc_now_iso())
     if manual:
-        log("digest sent (%d sent, %d shadow alerts today)" % (sent, shadowed))
+        log("digest %s (%d sent, %d shadow alerts in window)"
+            % ("sent" if ok else "FAILED to send", sent, shadowed))
+    return ok
 
 
 def maybe_daily_digest(conn):
@@ -1111,8 +1155,11 @@ def maybe_daily_digest(conn):
     today = now_local.strftime("%Y-%m-%d")
     if now_local.hour < DIGEST_HOUR_LOCAL or meta_get(conn, "last_digest_date") == today:
         return
-    send_daily_digest(conn)
-    meta_set(conn, "last_digest_date", today)
+    # Only mark the day done once it actually arrived: during shadow mode this
+    # is the sole thing reaching the phone, and a swallowed digest is
+    # indistinguishable from the dead pipeline it exists to rule out.
+    if send_daily_digest(conn):
+        meta_set(conn, "last_digest_date", today)
 
 
 def send_weekly_report(conn):
@@ -1223,6 +1270,8 @@ def check_fb_silence(conn):
         "SELECT MAX(scanned_at) FROM scans WHERE source='facebook'").fetchone()[0]
     if not last:
         return  # never received anything yet — setup pending, not breakage
+    # `last` includes heartbeats, so this measures browser liveness rather
+    # than "time since a new car was posted" (a quiet market is not breakage).
     try:
         last_dt = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     except ValueError:
@@ -1409,6 +1458,10 @@ def handle_ingest_items(conn, items):
         if isinstance(item, dict):
             lbl = str(item.get("label") or "facebook")[:40]
             by_label[lbl] = by_label.get(lbl, 0) + 1
+    if not items:
+        # Heartbeat: the userscript posts an empty batch when it has nothing
+        # new, so silence means a dead bridge rather than a quiet market.
+        record_scan(conn, "facebook", "heartbeat", 0, 0)
     for item in items:
         try:
             if not isinstance(item, dict):
@@ -1625,13 +1678,29 @@ def run_test():
                     continue
                 threshold = (scoring.Z_ALERT_DEALER if d.get("seller_type") == "Dealer"
                              else scoring.Z_ALERT.get(d["source"], -2.0))
+                # Mirror maybe_alert exactly, including the two suppressions
+                # that come after the gates — otherwise --test overstates what
+                # would fire for listings already alerted or reposted.
+                cutoff = (datetime.now(timezone.utc) - timedelta(
+                    days=scoring.FINGERPRINT_TTL_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                already = conn.execute(
+                    "SELECT 1 FROM alerts WHERE source=? AND listing_id=?",
+                    (d["source"], d["id"])).fetchone()
+                repost = d.get("fingerprint") and conn.execute(
+                    "SELECT 1 FROM listings WHERE fingerprint=? AND NOT (source=?"
+                    " AND id=?) AND first_seen_at >= ? LIMIT 1",
+                    (d["fingerprint"], d["source"], d["id"], cutoff)).fetchone()
                 if score["suppress"]:
                     verdict = "gated: " + ",".join(score["suppress"])
-                elif score["z"] <= threshold:
+                elif score["z"] > threshold:
+                    verdict = "above threshold"
+                elif already:
+                    verdict = "already alerted"
+                elif repost:
+                    verdict = "repost/cross-post"
+                else:
                     verdict = "would ALERT"
                     would_alert += 1
-                else:
-                    verdict = "above threshold"
                 print("   %-8.2f %-7s %-6d %-9s %-34s %s" % (
                     d["z"], "%d%%" % round(d["pct_below"]),
                     score["model"]["comp_count"], "$" + format(d["price"], ","),

@@ -115,7 +115,11 @@ grep '"event":"alert"' car-scanner.log | jq -r '[.ts,.z,.pct_below,.msg]|@tsv'
 ## Verifying it works: `--test`
 
 ```sh
-python3 autotrader_watcher.py --test
+# on the droplet — source the env file, or the run has no Telegram
+# credentials (systemd normally supplies them) and prints the message
+# instead of sending it
+set -a && . /etc/car-scanner.env && set +a
+python3 /opt/car-scanner/autotrader_watcher.py --test
 ```
 
 One live fetch, end to end, against a **throwaway copy** of the database
@@ -228,10 +232,26 @@ AutoTrader — append to `SEARCH_URLS` in `autotrader_watcher.py`:
 },
 ```
 
-Rules that matter: `sort=age&desc=1` is mandatory (only page one is read, so
-any other sort silently hides new listings); keep `zipr=100`; use a unique
-`label`, since it keys the seed flag, the health streak and the segment
-model. Body-type codes for `body=`: Hatchback 1, Convertible 2, Coupe 3,
+**Then add the label to `SEGMENT_MAP` in `scoring.py`** — this is easy to
+miss and the search will never score without it:
+
+```python
+SEGMENT_MAP = {
+    ...
+    "luxury_35k_60k": "luxury_35k_60k",   # its own segment, or point it at
+                                          # an existing one to share comps
+}
+```
+
+Segment models are fitted only over `set(SEGMENT_MAP.values())`, and a
+listing whose `search_label` isn't in the map gets no fallback model — so
+until its family reaches 30 comps on its own, nothing from that search can
+score at all. `--test` will show this as `nothing scored`.
+
+Other rules that matter: `sort=age&desc=1` is mandatory (only page one is
+read, so any other sort silently hides new listings); keep `zipr=100`; use a
+unique `label`, since it also keys the seed flag and the health streak.
+Body-type codes for `body=`: Hatchback 1, Convertible 2, Coupe 3,
 Wagon 5, Sedan 6, Others 7, Minivan 12, SUV 14, Pick-up 15 (comma-separate
 for several; an invalid code silently returns zero results, which
 `--test` will show you). Restart the service — the new search seeds

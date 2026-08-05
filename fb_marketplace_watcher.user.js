@@ -50,6 +50,7 @@
   const INGEST_BUFFER_CAP = 500;         // oldest dropped past this
   const INGEST_BATCH_MAX = 200;          // server-side items-per-request cap
   const INGEST_TIMEOUT_MS = 20 * 1000;
+  const INGEST_HEARTBEAT_MS = 15 * 60 * 1000;  // empty post so silence == dead tab
   // FB lazy-renders, so the first ticks legitimately see nothing. Five
   // consecutive empty ticks (~100s) on a sorted search page means the
   // anchors moved — i.e. the scraper is blind, which otherwise looks
@@ -179,12 +180,18 @@
     const token = GM_getValue("ingest_token", "");
     if (!token) return;
     const buf = GM_getValue("ingest_buffer", []);
-    if (buf.length === 0) return;
+    // An empty batch is a heartbeat: without it the droplet can't tell a
+    // quiet Marketplace from a closed tab, and would cry breakage on a slow
+    // afternoon. Sent at most once per INGEST_HEARTBEAT_MS.
+    if (buf.length === 0) {
+      if (Date.now() - GM_getValue("last_ingest_at", 0) < INGEST_HEARTBEAT_MS) return;
+    }
     const n = Math.min(buf.length, INGEST_BATCH_MAX);
     ingestInFlight = true;
     const done = (ok, why) => {
       ingestInFlight = false;
       if (ok) {
+        GM_setValue("last_ingest_at", Date.now());
         // splice against a re-read so items scraped mid-flight survive
         const cur = GM_getValue("ingest_buffer", []);
         GM_setValue("ingest_buffer", cur.slice(n));
