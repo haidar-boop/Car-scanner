@@ -50,6 +50,11 @@
   const INGEST_BUFFER_CAP = 500;         // oldest dropped past this
   const INGEST_BATCH_MAX = 200;          // server-side items-per-request cap
   const INGEST_TIMEOUT_MS = 20 * 1000;
+  // FB lazy-renders, so the first ticks legitimately see nothing. Five
+  // consecutive empty ticks (~100s) on a sorted search page means the
+  // anchors moved — i.e. the scraper is blind, which otherwise looks
+  // exactly like "no new listings in Edmonton".
+  const EMPTY_TICKS_ALARM = 5;
 
   // --------------------------------------------------------------------------
 
@@ -235,6 +240,22 @@
   // ordinary browsing on some other Marketplace search stays quiet.
   let lostWarned = false;
   let wasActive = false;
+  let emptyTicks = 0;
+  let emptyWarned = false;
+
+  function warnScraperBlind() {
+    if (emptyWarned) return;
+    emptyWarned = true;
+    console.warn("[car-watcher] no listing anchors found — FB markup changed?");
+    setBanner(true, "car-watcher: no listings found on this page — scraper may be blind");
+    const lastWarn = GM_getValue("empty_warned_at", 0);
+    if (Date.now() - lastWarn > WARN_COOLDOWN_MS) {
+      GM_setValue("empty_warned_at", Date.now());
+      telegramSend("🚨 BROKEN [facebook] the search page rendered but no listing " +
+                   "anchors were found over ~100s. Facebook likely changed its " +
+                   "markup — the userscript selector needs updating.");
+    }
+  }
 
   function warnLostSearch(reason) {
     if (lostWarned) return;
@@ -324,7 +345,17 @@
                          // appear while the sort is broken must still alert
                          // once it recovers, not be silently swallowed
     const listings = scrapeListings();
-    if (listings.length === 0) return; // page still rendering
+    if (listings.length === 0) {
+      // Don't mistake a permanently broken selector for a slow render.
+      if (++emptyTicks >= EMPTY_TICKS_ALARM) warnScraperBlind();
+      return;
+    }
+    if (emptyTicks >= EMPTY_TICKS_ALARM) {
+      setBanner(false);
+      console.log("[car-watcher] listings visible again");
+    }
+    emptyTicks = 0;
+    emptyWarned = false;
 
     const seenSet = loadSeen();
     const seenArr = GM_getValue("seen_ids", []);

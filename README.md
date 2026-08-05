@@ -11,9 +11,9 @@ underpriced cars around Edmonton. Precision over recall at every decision point.
   rotates through four Marketplace searches (cars ×2 price bands, trucks, SUVs)
   on a randomized 5–15 min reload and posts what it scrapes to the droplet.
 
-**Status: Step 3 of 5** (scoring engine live in shadow mode, phone-ready
-alerts and the daily digest). Failure hardening and `--test` arrive in
-Steps 4–5.
+**Status: Step 4 of 5** (scoring in shadow mode, phone-ready alerts, daily
+digest, silent-failure alarms). `--test` and the full troubleshooting guide
+arrive in Step 5.
 
 **The asking-price caveat, stated plainly:** everything scraped is an **asking**
 price, not a transaction price. The model predicts what a car will be *listed*
@@ -72,6 +72,46 @@ source and per search, alerts fired, rejections by reason, and the five best
 scores (marking which ones alerted). It goes out even on empty days, since
 silence is indistinguishable from a dead pipeline. Telegram or network
 failures are logged and swallowed; nothing can take down the poll loop.
+
+## Silent-failure alarms
+
+The dangerous failure isn't a crash — it's a parser that returns zero
+listings while the service looks healthy, so you conclude Edmonton has no
+deals for three weeks. Every path below announces itself:
+
+| Failure | Detection | Warning |
+|---|---|---|
+| Parser returns nothing | 2 consecutive empty scans, per search | `🚨 BROKEN [source/search]` naming the search and reason |
+| Droplet IP blocked | Cloudflare/bot-wall signatures in the response (status **and** body markers) | Same alarm, worded as a bot wall with a `curl` next step |
+| FB markup changed | 5 consecutive ticks (~100 s) with zero listing anchors | `🚨 BROKEN [facebook]` + red in-page banner |
+| FB bridge died (tab closed, logged out, bad token) | no ingest received for 6 h | `⚠️ FACEBOOK SILENT` |
+| **Partial** breakage | last 24 h volume below 40% of the trailing 7-day daily average, per source | `⚠️ VOLUME DROP` |
+| Search params silently dropped | applied-params echo compared against the request | `WARNING … search looks broken` |
+
+One empty scan is a blip and stays quiet; two in a row is breakage. All
+alarms are rate-limited (6 h, 12 h for volume) and the cooldown is stamped
+only after Telegram actually accepts the message — an outage delays an
+alarm, it never swallows it. The volume check needs 4 days of history
+before it will fire, so ramping up doesn't look like breakage.
+
+Poll timing stays randomized: 5–9 min per cycle on the droplet (plus 2–5 s
+between searches), 5–15 min per reload in the browser.
+
+## Logs
+
+Human-readable lines go to stderr (`journalctl -u car-scanner -f`). The
+same events go to a rotating file as one JSON object per line —
+`car-scanner.log`, 10 MB × 5 backups, path overridable with
+`CAR_SCANNER_LOG`. Tagged events: `scan_ok`, `scan_empty`,
+`scan_recovered`, `fetch_failed`, `reject`, `alert`, `suppress`,
+`volume_drop`, `fb_silent`, `lifespan_gone`, `refit`.
+
+```sh
+# what got rejected today, by reason
+grep '"event":"reject"' car-scanner.log | jq -r .reason | sort | uniq -c
+# every alert with its z-score
+grep '"event":"alert"' car-scanner.log | jq -r '[.ts,.z,.pct_below,.msg]|@tsv'
+```
 
 ## Shadow mode and the feedback loop
 

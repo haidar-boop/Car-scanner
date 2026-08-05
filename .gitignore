@@ -2,4 +2,6 @@ listings.db
 listings.db-wal
 listings.db-shm
 car-scanner.env
+car-scanner.log
+car-scanner.log.*
 __pycache__/

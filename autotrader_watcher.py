@@ -16,6 +16,7 @@ verify_search_state() catch the next silent URL-format migration (the old
 import argparse
 import hmac
 import json
+import logging
 import math
 import os
 import random
@@ -27,6 +28,7 @@ import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from logging.handlers import RotatingFileHandler
 
 import requests
 
@@ -88,6 +90,21 @@ INGEST_BIND = os.environ.get("INGEST_BIND", "0.0.0.0:8477")
 INGEST_MAX_BODY = 256 * 1024
 INGEST_MAX_ITEMS = 200
 
+LOG_PATH = os.environ.get(
+    "CAR_SCANNER_LOG",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "car-scanner.log"))
+LOG_MAX_BYTES = 10 * 1024 * 1024
+LOG_BACKUPS = 5
+
+# Silent-failure alarms. A parser that returns nothing looks exactly like a
+# quiet market, so breakage has to announce itself.
+ZERO_STREAK_ALARM = 2                  # consecutive empty scans before warning
+HEALTH_WARN_COOLDOWN_S = 6 * 3600
+VOLUME_DROP_RATIO = 0.4                # today < 40% of average = >60% drop
+VOLUME_MIN_HISTORY_DAYS = 4            # don't cry breakage during ramp-up
+VOLUME_WARN_COOLDOWN_S = 12 * 3600
+FB_SILENCE_ALARM_S = 6 * 3600          # ingest quiet this long = browser died
+
 LIFESPAN_CHECK_INTERVAL_S = 6 * 3600   # re-check each scored listing this often
 LIFESPAN_CHECK_CAP = 20                # max direct re-fetches per poll cycle
 LIFESPAN_MAX_DAYS = 7                  # stop checking once a listing is this old
@@ -108,26 +125,110 @@ def utc_now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def log(msg):
-    print("[%s] %s" % (utc_now_iso(), msg), file=sys.stderr, flush=True)
+class _JsonFormatter(logging.Formatter):
+    def format(self, record):
+        payload = {
+            "ts": datetime.fromtimestamp(record.created, timezone.utc)
+                          .strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "level": record.levelname,
+            "event": getattr(record, "event", "log"),
+            "msg": record.getMessage(),
+        }
+        payload.update(getattr(record, "fields", None) or {})
+        try:
+            return json.dumps(payload, default=str)
+        except Exception:
+            return json.dumps({"ts": payload["ts"], "level": "ERROR",
+                               "event": "log_format_failed"})
+
+
+_logger = None
+
+
+def get_logger():
+    """stderr stays human-readable for journalctl; the rotating file gets
+    one JSON object per line so breakage can be grepped after the fact."""
+    global _logger
+    if _logger is not None:
+        return _logger
+    logger = logging.getLogger("car_scanner")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if not logger.handlers:
+        stream = logging.StreamHandler(sys.stderr)
+        stream.setFormatter(logging.Formatter("[%(asctime)s] %(message)s",
+                                              datefmt="%Y-%m-%dT%H:%M:%SZ"))
+        logger.addHandler(stream)
+        try:
+            os.makedirs(os.path.dirname(LOG_PATH) or ".", exist_ok=True)
+            rotating = RotatingFileHandler(
+                LOG_PATH, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS)
+            rotating.setFormatter(_JsonFormatter())
+            logger.addHandler(rotating)
+        except Exception as e:  # unwritable path must not stop the watcher
+            print("[warn] file logging disabled (%s): %s" % (LOG_PATH, e),
+                  file=sys.stderr, flush=True)
+    _logger = logger
+    return logger
+
+
+def log(msg, event=None, **fields):
+    get_logger().info(msg, extra={"event": event or "log", "fields": fields})
+
+
+# Cloudflare / bot-wall signatures. A blocked droplet IP looks exactly like
+# "Edmonton has no cars" unless it is called out by name.
+CHALLENGE_MARKERS = (
+    "just a moment", "cf-browser-verification", "cf_chl_", "__cf_chl",
+    "checking your browser", "attention required! | cloudflare",
+    "enable javascript and cookies to continue", "access denied",
+    "please verify you are a human", "px-captcha", "perimeterx",
+)
+
+
+def detect_bot_challenge(resp):
+    """Returns a reason string when a response looks like a bot wall."""
+    if resp.status_code in (401, 403, 429):
+        return "http_%d" % resp.status_code
+    if resp.status_code == 503:
+        return "http_503_maybe_challenge"
+    server = (resp.headers.get("Server") or "").lower()
+    body = (resp.text or "")[:20000].lower()
+    for marker in CHALLENGE_MARKERS:
+        if marker in body:
+            return "challenge_page:%s" % marker[:32]
+    if "cloudflare" in server and resp.status_code != 200:
+        return "cloudflare_%d" % resp.status_code
+    return None
 
 
 def fetch_page(url):
-    """GET a search page. Returns HTML text or None; never raises."""
+    """GET a search page. Returns (html, problem); never raises.
+
+    problem is None on success, else a short reason — bot challenges are
+    distinguished from ordinary failures so the operator learns the droplet
+    IP is blocked rather than assuming the city ran out of cars.
+    """
     headers = {"User-Agent": USER_AGENT, "Accept-Language": "en-CA,en;q=0.9"}
     backoff = FETCH_BACKOFF_S
+    problem = "unreachable"
     for attempt in range(1, FETCH_RETRIES + 1):
         try:
             resp = requests.get(url, headers=headers, timeout=FETCH_TIMEOUT_S)
-            if resp.status_code == 200:
-                return resp.text
-            log("fetch attempt %d: HTTP %d for %s" % (attempt, resp.status_code, url))
+            challenge = detect_bot_challenge(resp)
+            if resp.status_code == 200 and not challenge:
+                return resp.text, None
+            problem = challenge or "http_%d" % resp.status_code
+            log("fetch attempt %d: %s for %s" % (attempt, problem, url),
+                event="fetch_failed", attempt=attempt, problem=problem, url=url)
         except requests.RequestException as e:
-            log("fetch attempt %d failed: %s" % (attempt, e))
+            problem = "network:%s" % e.__class__.__name__
+            log("fetch attempt %d failed: %s" % (attempt, e),
+                event="fetch_failed", attempt=attempt, problem=problem)
         if attempt < FETCH_RETRIES:
             time.sleep(backoff)
             backoff *= 2
-    return None
+    return None, problem
 
 
 def extract_next_data(html):
@@ -573,19 +674,62 @@ def record_scan(conn, source, search_label, parsed_count, new_count):
         log("record_scan failed: %s" % e)
 
 
+def cooldown_passed(conn, key, seconds):
+    """True when key hasn't fired within `seconds`. Does not stamp — the
+    caller stamps only after a successful send, so a Telegram outage can't
+    silently consume an alarm."""
+    last = meta_get(conn, key)
+    if not last:
+        return True
+    try:
+        last_dt = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return True
+    return (datetime.now(timezone.utc) - last_dt).total_seconds() >= seconds
+
+
+def record_health(conn, source, label, ok, reason=None):
+    """Track consecutive empty/failed scans; warn once the streak proves it.
+
+    One empty scan is a blip (a hiccup, a slow page). Two in a row on a
+    market this size is the parser being broken — which is the failure that
+    otherwise reads as 'no deals in Edmonton for three weeks'.
+    """
+    key = "zero_streak:%s:%s" % (source, label)
+    if ok:
+        if meta_get(conn, key) not in (None, "0"):
+            log("[%s/%s] recovered" % (source, label), event="scan_recovered",
+                source=source, search_label=label)
+        meta_set(conn, key, "0")
+        return
+    streak = int(meta_get(conn, key) or 0) + 1
+    meta_set(conn, key, str(streak))
+    log("[%s/%s] empty scan #%d (%s)" % (source, label, streak, reason),
+        event="scan_empty", source=source, search_label=label,
+        streak=streak, reason=reason)
+    if streak < ZERO_STREAK_ALARM:
+        return
+    warn_key = "health_warned_at:%s:%s" % (source, label)
+    if not cooldown_passed(conn, warn_key, HEALTH_WARN_COOLDOWN_S):
+        return
+    if reason and (reason.startswith("challenge") or reason.startswith("http_4")
+                   or reason.startswith("cloudflare") or reason == "http_503_maybe_challenge"):
+        detail = ("Looks like a bot wall (%s) — the droplet IP may be blocked. "
+                  "Try curling the search URL from the droplet." % reason)
+    else:
+        detail = ("Reason: %s. If the site changed its markup the parser needs "
+                  "updating — a silent zero looks identical to an empty market."
+                  % reason)
+    if telegram_send("🚨 BROKEN [%s/%s] %d consecutive scans returned no listings.\n%s"
+                     % (source, label, streak, detail)):
+        meta_set(conn, warn_key, utc_now_iso())
+
+
 def warn_search_broken(conn, label, problems):
     """Rate-limited (per label, 6h) Telegram warning that a search looks broken."""
     key = "verify_warned_at:%s" % label
-    last = meta_get(conn, key)
-    if last:
-        try:
-            last_dt = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").replace(
-                tzinfo=timezone.utc
-            )
-            if (datetime.now(timezone.utc) - last_dt).total_seconds() < VERIFY_WARN_COOLDOWN_S:
-                return
-        except ValueError:
-            pass
+    if not cooldown_passed(conn, key, VERIFY_WARN_COOLDOWN_S):
+        return
     sent = telegram_send(
         "WARNING [autotrader/%s] search looks broken; notifications suppressed "
         "this cycle:\n- %s" % (label, "\n- ".join(problems))
@@ -633,7 +777,9 @@ def maybe_alert(conn, row, score):
     if score["suppress"]:
         if score["z"] <= scoring.Z_ALERT.get(src, -2.0):
             log("[suppress] %s/%s z=%.2f gated: %s"
-                % (src, lid, score["z"], ",".join(score["suppress"])))
+                % (src, lid, score["z"], ",".join(score["suppress"])),
+                event="suppress", source=src, listing_id=lid,
+                z=round(score["z"], 2), reason=",".join(score["suppress"]))
         return
     threshold = (scoring.Z_ALERT_DEALER if row.get("seller_type") == "Dealer"
                  else scoring.Z_ALERT.get(src, -2.0))
@@ -647,7 +793,9 @@ def maybe_alert(conn, row, score):
         (row["fingerprint"], src, lid, cutoff),
     ).fetchone():
         log("[suppress] %s/%s z=%.2f: repost/cross-post fingerprint match"
-            % (src, lid, score["z"]))
+            % (src, lid, score["z"]),
+            event="suppress", source=src, listing_id=lid,
+            z=round(score["z"], 2), reason="repost_fingerprint")
         return
     m = score["model"]
     age = scoring.age_of(row["year"])
@@ -672,7 +820,12 @@ def maybe_alert(conn, row, score):
         return
     log("[alert%s] #%d %s/%s z=%.2f %d%% below $%d predicted"
         % (" shadow" if shadow else "", cur.lastrowid, src, lid,
-           score["z"], round(score["pct_below"]), predicted))
+           score["z"], round(score["pct_below"]), predicted),
+        event="alert", alert_id=cur.lastrowid, source=src, listing_id=lid,
+        z=round(score["z"], 2), pct_below=round(score["pct_below"], 1),
+        price=row["price"], predicted=predicted, shadow=bool(shadow),
+        model_key=m["model_key"], comps=m["comp_count"],
+        low_confidence=bool(score["low_confidence"]))
     if not shadow:
         seen_row = conn.execute(
             "SELECT first_seen_at FROM listings WHERE source=? AND id=?",
@@ -696,7 +849,9 @@ def process_new_rows(conn, rows, allow_alerts):
                 )
             if reason:
                 log("[reject] %s/%s %s: %s" % (r["source"], r["id"], reason,
-                                               (r.get("title") or "")[:60]))
+                                               (r.get("title") or "")[:60]),
+                    event="reject", source=r["source"], listing_id=r["id"],
+                    reason=reason, price=r.get("price"))
                 continue
             r = dict(r, family=family, fingerprint=fp)
             score = score_listing(conn, r)
@@ -760,22 +915,30 @@ def poll_once(conn):
             time.sleep(random.uniform(*BETWEEN_SEARCHES_S))
         label, url = search["label"], search["url"]
         try:
-            html = fetch_page(url)
+            html, fetch_problem = fetch_page(url)
             if html is None:
-                log("[%s] fetch failed after retries" % label)
+                log("[%s] fetch failed after retries (%s)" % (label, fetch_problem))
+                record_health(conn, "autotrader", label, ok=False, reason=fetch_problem)
                 continue
             page_props = extract_next_data(html)
             if page_props is None:
                 log("[%s] no __NEXT_DATA__ found — page structure changed?" % label)
-                warn_search_broken(conn, label, ["__NEXT_DATA__ missing from page"])
+                record_health(conn, "autotrader", label, ok=False,
+                              reason="__NEXT_DATA__ missing")
                 continue
             rows = parse_listings(page_props, label)
             problems = verify_search_state(page_props, url, parsed_count=len(rows))
             new_rows = store_listings(conn, rows)  # comp data is comp data — always store
             record_scan(conn, "autotrader", label, len(rows), len(new_rows))
+            # An empty page is streak-tracked (could be a blip); applied-param
+            # drift is config-level breakage and warns on the first sighting.
+            record_health(conn, "autotrader", label, ok=bool(rows),
+                          reason=None if rows else "zero listings parsed")
+            drift = [p for p in problems if p.startswith("param ")]
+            if drift:
+                warn_search_broken(conn, label, drift)
             if problems:
                 log("[%s] search-state problems: %s" % (label, "; ".join(problems)))
-                warn_search_broken(conn, label, problems)
                 # Still assess+score the rows (they'd otherwise sit unassessed
                 # until the next restart's backfill) — just never alert off a
                 # search that failed verification.
@@ -783,7 +946,10 @@ def poll_once(conn):
                 continue
             parsed_counts[label] = len(rows)
             log("[%s] parsed %d listings (%d new) of %s total"
-                % (label, len(rows), len(new_rows), page_props.get("numberOfResults")))
+                % (label, len(rows), len(new_rows), page_props.get("numberOfResults")),
+                event="scan_ok", source="autotrader", search_label=label,
+                parsed=len(rows), new=len(new_rows),
+                site_total=page_props.get("numberOfResults"))
             seeding = meta_get(conn, seed_key(label)) != "1"
             if seeding:
                 meta_set(conn, seed_key(label), "1")
@@ -826,7 +992,7 @@ def maybe_refit(conn):
     global KNOWN
     KNOWN = scoring.known_vehicles(conn)
     meta_set(conn, "last_refit_date", today)
-    log("refit: %d models written" % n)
+    log("refit: %d models written" % n, event="refit", models=n)
 
 
 def local_day_start_utc():
@@ -1000,6 +1166,73 @@ def maybe_weekly_report(conn):
         meta_set(conn, "last_weekly_date", today)
 
 
+def check_scan_volume(conn):
+    """Partial breakage: volume quietly collapses while scans still 'work'.
+
+    Compares the last 24h against the daily average of the 7 days before it,
+    per source — one dead search or a dead FB tab halves a source's volume
+    without ever returning a zero scan.
+    """
+    now = datetime.now(timezone.utc)
+    day_ago = (now - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    week_ago = (now - timedelta(days=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rows = conn.execute(
+        """SELECT source,
+                  SUM(CASE WHEN scanned_at >= ? THEN parsed_count ELSE 0 END) AS today,
+                  SUM(CASE WHEN scanned_at <  ? THEN parsed_count ELSE 0 END) AS prior,
+                  COUNT(DISTINCT CASE WHEN scanned_at < ? THEN date(scanned_at) END) AS days
+           FROM scans WHERE scanned_at >= ? GROUP BY source""",
+        (day_ago, day_ago, day_ago, week_ago)).fetchall()
+    for r in rows:
+        if (r["days"] or 0) < VOLUME_MIN_HISTORY_DAYS:
+            continue  # not enough history to call anything abnormal
+        avg = (r["prior"] or 0) / float(r["days"])
+        if avg <= 0:
+            continue
+        today = r["today"] or 0
+        if today >= VOLUME_DROP_RATIO * avg:
+            continue
+        key = "volume_warned_at:%s" % r["source"]
+        if not cooldown_passed(conn, key, VOLUME_WARN_COOLDOWN_S):
+            continue
+        drop = 100 * (1 - today / avg)
+        log("volume drop on %s: %d vs %.0f/day" % (r["source"], today, avg),
+            event="volume_drop", source=r["source"], today=today, avg=avg)
+        if telegram_send(
+            "⚠️ VOLUME DROP [%s] %d listings scanned in 24h vs %.0f/day average "
+            "(%.0f%% below).\nPartial breakage — one search or the FB tab may be "
+            "dead while the rest still works." % (r["source"], today, avg, drop)
+        ):
+            meta_set(conn, key, utc_now_iso())
+
+
+def check_fb_silence(conn):
+    """The FB bridge dies silently: closed tab, logged-out browser, bad token."""
+    if not INGEST_TOKEN:
+        return  # bridge not configured; nothing to be silent about
+    last = conn.execute(
+        "SELECT MAX(scanned_at) FROM scans WHERE source='facebook'").fetchone()[0]
+    if not last:
+        return  # never received anything yet — setup pending, not breakage
+    try:
+        last_dt = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return
+    quiet_s = (datetime.now(timezone.utc) - last_dt).total_seconds()
+    if quiet_s < FB_SILENCE_ALARM_S:
+        return
+    if not cooldown_passed(conn, "fb_silence_warned_at", FB_SILENCE_ALARM_S):
+        return
+    log("facebook ingest silent for %.1fh" % (quiet_s / 3600.0),
+        event="fb_silent", quiet_hours=round(quiet_s / 3600.0, 1))
+    if telegram_send(
+        "⚠️ FACEBOOK SILENT — no listings received from the browser in %.1fh.\n"
+        "Check the pinned Marketplace tab is open and logged in, and that the "
+        "ingest token still matches." % (quiet_s / 3600.0)
+    ):
+        meta_set(conn, "fb_silence_warned_at", utc_now_iso())
+
+
 def classify_listing_check(resp, listing_id):
     """'alive' | 'gone' | 'unknown' for one lifespan probe.
 
@@ -1063,7 +1296,8 @@ def recheck_listings(conn):
                     " WHERE source=? AND id=?",
                     (checked_at, checked_at, r["source"], r["id"]))
                 log("[lifespan] %s/%s disappeared (confirmed on 2nd check)"
-                    % (r["source"], r["id"]))
+                    % (r["source"], r["id"]),
+                    event="lifespan_gone", source=r["source"], listing_id=r["id"])
             elif verdict == "gone":
                 conn.execute(
                     "UPDATE listings SET last_checked_at=?, gone_suspected_at=?"
@@ -1081,9 +1315,20 @@ def recheck_listings(conn):
         time.sleep(random.uniform(1.5, 3.5))
 
 
+def refresh_known(conn):
+    """Re-read the make/model dictionary the FB title parser matches against.
+
+    It grows with every AutoTrader family stored, and FB rows whose model
+    can't be matched are dropped as incomplete — so a dictionary refreshed
+    only at the nightly refit would keep FB parsing degraded all day.
+    """
+    global KNOWN
+    KNOWN = scoring.known_vehicles(conn)
+
+
 def run_scheduled_tasks(conn):
-    for task in (maybe_refit, maybe_daily_digest, maybe_weekly_report,
-                 recheck_listings):
+    for task in (refresh_known, check_scan_volume, check_fb_silence, maybe_refit,
+                 maybe_daily_digest, maybe_weekly_report, recheck_listings):
         try:
             task(conn)
         except Exception as e:
