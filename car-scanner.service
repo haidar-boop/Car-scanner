@@ -1,0 +1,18 @@
+[Unit]
+Description=Car Scanner - AutoTrader Edmonton watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=carscanner
+WorkingDirectory=/opt/car-scanner
+EnvironmentFile=/etc/car-scanner.env
+ExecStart=/usr/bin/python3 /opt/car-scanner/autotrader_watcher.py
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

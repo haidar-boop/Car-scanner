@@ -1,0 +1,5 @@
+listings.db
+listings.db-wal
+listings.db-shm
+car-scanner.env
+__pycache__/
