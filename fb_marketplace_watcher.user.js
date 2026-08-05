@@ -50,9 +50,13 @@
   // is full of recommendation anchors that are neither new nor price-filtered,
   // so scraping there would be pure false-alert noise, and rotating there
   // would hijack tabs the user is actually reading.
+  function onSearchPath() {
+    return location.pathname.includes("/marketplace/") &&
+           location.pathname.includes("/search");
+  }
+
   function activeSearch() {
-    if (!location.pathname.includes("/marketplace/") ||
-        !location.pathname.includes("/search")) return null;
+    if (!onSearchPath()) return null;
     const here = new URLSearchParams(location.search);
     for (const s of SEARCH_URLS) {
       const want = new URL(s.url);
@@ -134,21 +138,40 @@
     GM_setValue("seen_ids", ids.slice(-SEEN_CAP));
   }
 
-  function setBanner(show) {
-    const existing = document.getElementById("car-watcher-sort-warning");
+  function setBanner(show, text) {
+    const existing = document.getElementById("car-watcher-warning");
     if (!show) {
       if (existing) existing.remove();
       return;
     }
-    if (existing) return;
-    const banner = document.createElement("div");
-    banner.id = "car-watcher-sort-warning";
-    banner.textContent =
-      "car-watcher: this page is NOT sorted by newest — alerts suspended";
+    const banner = existing || document.createElement("div");
+    banner.id = "car-watcher-warning";
+    banner.textContent = text;
     banner.style.cssText =
       "position:fixed;top:0;left:0;right:0;z-index:99999;background:#c0392b;" +
       "color:#fff;font:14px sans-serif;padding:6px;text-align:center;";
-    document.body.appendChild(banner);
+    if (!existing) document.body.appendChild(banner);
+  }
+
+  // A tab that stops matching a configured search has stopped watching, and
+  // silence is indistinguishable from "no new listings" — so say so loudly
+  // rather than no-op'ing. Only fires when we *expected* to be watching:
+  // ordinary browsing on some other Marketplace search stays quiet.
+  let lostWarned = false;
+  let wasActive = false;
+
+  function warnLostSearch(reason) {
+    if (lostWarned) return;
+    lostWarned = true;
+    console.warn("[car-watcher]", reason);
+    setBanner(true, "car-watcher: " + reason + " — alerts suspended");
+    const lastWarn = GM_getValue("lost_warned_at", 0);
+    if (Date.now() - lastWarn > WARN_COOLDOWN_MS) {
+      GM_setValue("lost_warned_at", Date.now());
+      telegramSend("WARNING [facebook] " + reason + "; alerts suspended for this " +
+                   "tab. Facebook may have changed its search URL format — check " +
+                   "SEARCH_URLS in the userscript.");
+    }
   }
 
   function checkSortGuard() {
@@ -161,7 +184,7 @@
       return true;
     }
     console.warn("[car-watcher] sortBy=creation_time_descend missing from URL");
-    setBanner(true);
+    setBanner(true, "car-watcher: this page is NOT sorted by newest — alerts suspended");
     const lastWarn = GM_getValue("sort_warned_at", 0);
     if (Date.now() - lastWarn > WARN_COOLDOWN_MS) {
       GM_setValue("sort_warned_at", Date.now());
@@ -193,7 +216,15 @@
 
   function tick() {
     const search = activeSearch();
-    if (!search) return; // SPA-navigated off our searches — do nothing at all
+    if (!search) {
+      // Drifting off a search we were actively watching means FB rewrote the
+      // URL under us (SPA navigation strips params without a reload).
+      if (wasActive && onSearchPath()) {
+        warnLostSearch("search tab lost its configured query parameters");
+      }
+      return; // navigated to an item/home page — that's normal, stay quiet
+    }
+    wasActive = true;
     const sortOk = checkSortGuard();
     if (!sortOk) return; // don't notify AND don't mark seen: listings that
                          // appear while the sort is broken must still alert
@@ -235,6 +266,9 @@
     setTimeout(() => {
       const next = (GM_getValue("rot_idx", 0) + 1) % SEARCH_URLS.length;
       GM_setValue("rot_idx", next);
+      // Remember where we meant to land, so the next page load can tell a
+      // failed rotation apart from the user browsing somewhere else.
+      GM_setValue("rot_expect", SEARCH_URLS[next].label);
       location.href = SEARCH_URLS[next].url;
     }, delay);
   }
@@ -247,8 +281,19 @@
     // watcher; ordinary browsing tabs are left alone (no rotation hijack, no
     // concurrent writers racing on the seen-ID store). To start watching, pin
     // a tab and open the first SEARCH_URLS entry in it.
-    if (!activeSearch()) return;
-    console.log("[car-watcher] active on", activeSearch().label);
+    const search = activeSearch();
+    if (!search) {
+      // A rotation we initiated must land on a configured search. If it
+      // didn't, FB changed its URL format and the watcher is now blind.
+      const expected = GM_getValue("rot_expect", "");
+      if (expected && onSearchPath()) {
+        GM_setValue("rot_expect", "");
+        warnLostSearch("rotation into '" + expected + "' landed on an unrecognized search URL");
+      }
+      return;
+    }
+    GM_setValue("rot_expect", "");
+    console.log("[car-watcher] active on", search.label);
     tick();
     setInterval(tick, SCRAPE_INTERVAL_MS);
     scheduleRotateReload();

@@ -389,8 +389,36 @@ def warn_search_broken(conn, label, problems):
         meta_set(conn, key, utc_now_iso())
 
 
-def poll_once(conn, notifications_enabled):
+def seed_key(label):
+    return "seeded:%s" % label
+
+
+def migrate_seed_flags(conn):
+    """Convert the old single global seed flag into per-search flags.
+
+    Only searches that already have stored listings count as seeded — a
+    search added to SEARCH_URLS later must seed itself rather than inherit
+    someone else's flag and flood Telegram with its whole first page.
+    """
+    if meta_get(conn, "seeded") != "1":
+        return
+    for search in SEARCH_URLS:
+        label = search["label"]
+        row = conn.execute(
+            "SELECT 1 FROM listings WHERE search_label=? LIMIT 1", (label,)
+        ).fetchone()
+        if row and meta_get(conn, seed_key(label)) != "1":
+            meta_set(conn, seed_key(label), "1")
+    meta_set(conn, "seeded", "migrated")
+
+
+def poll_once(conn):
     """One pass over all searches. Returns {label: parsed_count} for the pass.
+
+    Seeding is per search: a search's first clean pass stores its current
+    inventory silently, then flips its own flag. So one persistently broken
+    search can never mute the healthy ones, and a search added to
+    SEARCH_URLS later seeds itself instead of flooding Telegram.
 
     Each search body is exception-isolated so a transient DB error on one
     search can't skip the others.
@@ -420,10 +448,14 @@ def poll_once(conn, notifications_enabled):
             parsed_counts[label] = len(rows)
             log("[%s] parsed %d listings (%d new) of %s total"
                 % (label, len(rows), len(new_rows), page_props.get("numberOfResults")))
-            if notifications_enabled:
-                for r in new_rows:
-                    telegram_send(format_new_listing(r))
-                    time.sleep(1.0)  # stay under Telegram rate limits
+            if meta_get(conn, seed_key(label)) != "1":
+                meta_set(conn, seed_key(label), "1")
+                log("[%s] seeded %d listings — notifications enabled for this search"
+                    % (label, len(rows)))
+                continue
+            for r in new_rows:
+                telegram_send(format_new_listing(r))
+                time.sleep(1.0)  # stay under Telegram rate limits
         except Exception as e:
             log("[%s] search failed: %s" % (label, e))
     return parsed_counts
@@ -432,30 +464,15 @@ def poll_once(conn, notifications_enabled):
 def main():
     log("starting autotrader watcher; db=%s" % DB_PATH)
     conn = init_db(DB_PATH)
-    # Seed mode: notifications stay off until one full pass has parsed every
-    # search cleanly, recorded via an explicit meta flag. Inferring seed state
-    # from row count would flood Telegram after a partial seed + restart, or
-    # after a first boot where the network wasn't up yet.
-    while meta_get(conn, "seeded") != "1":
-        try:
-            counts = poll_once(conn, notifications_enabled=False)
-            if all(counts.get(s["label"]) for s in SEARCH_URLS):
-                meta_set(conn, "seeded", "1")
-                log("seeded %d listings — notifications enabled"
-                    % conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0])
-                break
-            log("seed pass incomplete (%s) — retrying next cycle" % (counts,))
-        except Exception as e:
-            log("seed pass failed: %s" % e)
-        time.sleep(POLL_INTERVAL_BASE_S + random.uniform(0, POLL_JITTER_S))
+    migrate_seed_flags(conn)
     while True:
+        try:
+            poll_once(conn)
+        except Exception as e:
+            log("poll cycle failed: %s" % e)
         sleep_s = POLL_INTERVAL_BASE_S + random.uniform(0, POLL_JITTER_S)
         log("sleeping %.0fs" % sleep_s)
         time.sleep(sleep_s)
-        try:
-            poll_once(conn, notifications_enabled=True)
-        except Exception as e:
-            log("poll cycle failed: %s" % e)
 
 
 if __name__ == "__main__":
