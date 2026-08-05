@@ -11,9 +11,8 @@ underpriced cars around Edmonton. Precision over recall at every decision point.
   rotates through four Marketplace searches (cars ×2 price bands, trucks, SUVs)
   on a randomized 5–15 min reload and posts what it scrapes to the droplet.
 
-**Status: Step 4 of 5** (scoring in shadow mode, phone-ready alerts, daily
-digest, silent-failure alarms). `--test` and the full troubleshooting guide
-arrive in Step 5.
+**Status: complete** (all five steps). The system scans, scores in shadow
+mode for its first two weeks, alerts, digests, and shouts when it breaks.
 
 **The asking-price caveat, stated plainly:** everything scraped is an **asking**
 price, not a transaction price. The model predicts what a car will be *listed*
@@ -113,6 +112,172 @@ grep '"event":"reject"' car-scanner.log | jq -r .reason | sort | uniq -c
 grep '"event":"alert"' car-scanner.log | jq -r '[.ts,.z,.pct_below,.msg]|@tsv'
 ```
 
+## Verifying it works: `--test`
+
+```sh
+python3 autotrader_watcher.py --test
+```
+
+One live fetch, end to end, against a **throwaway copy** of the database
+(SQLite backup API, WAL-safe against the running service) — it prints
+listings parsed per search, the rejection breakdown, the models it fitted,
+and a table of the top scored listings with z, percent below and comp count,
+then sends **exactly one** Telegram message and deletes the copy. Incidental
+warnings that would normally fire are collected and counted instead of sent,
+so the one-message promise holds even when a search is broken. Real output:
+
+```
+--- 1. LIVE FETCH ------------------------------------------------
+  cars_2k_15k          20 parsed of 1,748 site-wide    1.2s  OK
+  cars_15k_35k         20 parsed of 4,916 site-wide    1.0s  OK
+  trucks_suvs_5k_30k   20 parsed of 3,502 site-wide    1.7s  OK
+  60 listings fetched (45 unique — searches overlap), 6 not already in the database
+
+--- 2. REJECTION BREAKDOWN ---------------------------------------
+  incomplete                 2  (4%)
+  clean                     43  (96%)  eligible for scoring
+
+--- 4. TOP SCORED LISTINGS ---------------------------------------
+   z        below   comps  price     vehicle                     verdict
+   -2.78    30%     21     $6,680    2014 Dodge Journey          would ALERT
+   -1.51    26%     21     $16,999   2020 Nissan Kicks           above threshold
+   -1.49    17%     21     $9,997    2019 Dodge Journey          above threshold
+   ...
+```
+
+Run it after any change to the search URLs, after a site redesign, or any
+time the alerts go quiet and you want to know whether that's the market or
+the scraper.
+
+## How much data before you can trust the scorer
+
+Measured on this market, not guessed: two page-one snapshots 1.21 h apart
+shared 28 of 46 listings (so nothing had rolled off unseen), giving
+**~297 new listings/day** across the three searches and a page-one turnover
+of ~4.8 h. At a 7-minute poll that's ~1.4 new listings per cycle against 20
+slots per search — the poller is comfortably fast enough, with ~40× headroom.
+
+Thresholds the code enforces: **8 comps** minimum to score at all,
+**30 comps** for a family to get its own curve (below that it borrows the
+segment model and the alert is marked low-confidence).
+
+What that means in days, from the observed family mix (~56 families in the
+sample; shares are long-tailed):
+
+| Family | Share of arrivals | Reaches 8 comps | Reaches 30 comps |
+|---|---|---|---|
+| RAV4 | ~5.7% | ~0.5 day | ~2 days |
+| Escape / Rogue | ~4.5% | ~0.6 day | ~2 days |
+| Tucson / Tiguan / Sentra | ~3.4% | ~0.8 day | ~3 days |
+| median family | ~1.8% | ~1.5 days | ~6 days |
+
+- **After ~3 days** the top ~8 families have their own curves, covering
+  roughly a third of arriving listings.
+- **After ~1 week** ~20 families are covered — about 60% of arrivals — and
+  the daily digest becomes genuinely informative.
+- **After ~2 weeks** (the shadow-mode window, not a coincidence) most
+  regularly-listed families have 30+ comps.
+
+My honest recommendation: **treat z-scores as advisory until a family has
+~50 comps.** Thirty is enough to fit a stable curve, but the MAD — the
+denominator of every z — is still noisy there, so a z of −2.2 on a
+30-comp family is a weaker claim than the same number on a 100-comp one.
+The comp count is printed in every alert for exactly this reason. Rare
+families (one listing a week) may never reach 30; they will keep scoring
+through the segment model, flagged low-confidence, which is the correct
+outcome rather than a false precision.
+
+Caveat on the numbers above: they come from ~88 real listings pooled over a
+few hours, so the long tail is under-sampled and rare families will be
+slower than the table suggests. Re-run `--test` after a week to see real
+counts — it prints exactly this breakdown from your own database.
+
+## Tuning
+
+**The z threshold** lives in `scoring.py`:
+
+```python
+Z_ALERT = {"autotrader": -2.0, "facebook": -2.0}
+Z_ALERT_DEALER = -2.5
+```
+
+More negative = fewer, better alerts. Change it based on the labels you
+collect, not on a hunch: after a couple of weeks of `--label`, the Sunday
+report gives you a precision rate. If precision is high and you feel you're
+missing deals, loosen to −1.8; if you're triaging junk, tighten to −2.3.
+Move it 0.2 at a time and wait a week — a threshold change alters which
+listings alert, and you need a fresh batch of labels to judge it. The
+dealer threshold should stay stricter than the private one; dealer pricing
+is already market-calibrated, so an apparent dealer bargain more often has
+a catch.
+
+Other knobs worth knowing, all in `scoring.py`: `BLOCKLIST_TERMS` (add
+anything the weekly report suggests), `MIN_COMPS_GATE` (8),
+`FAMILY_MODEL_MIN_COMPS` (30), `MAD_MIN` / `MAD_MAX` (degenerate and absurd
+spread bounds), `FINGERPRINT_TTL_DAYS` (90-day repost suppression).
+
+## Adding a fourth search
+
+AutoTrader — append to `SEARCH_URLS` in `autotrader_watcher.py`:
+
+```python
+{
+    "label": "luxury_35k_60k",
+    "url": "https://www.autotrader.ca/cars/reg_ab/cit_edmonton/ot_used"
+           "?pricefrom=35000&priceto=60000&sort=age&desc=1&zipr=100",
+},
+```
+
+Rules that matter: `sort=age&desc=1` is mandatory (only page one is read, so
+any other sort silently hides new listings); keep `zipr=100`; use a unique
+`label`, since it keys the seed flag, the health streak and the segment
+model. Body-type codes for `body=`: Hatchback 1, Convertible 2, Coupe 3,
+Wagon 5, Sedan 6, Others 7, Minivan 12, SUV 14, Pick-up 15 (comma-separate
+for several; an invalid code silently returns zero results, which
+`--test` will show you). Restart the service — the new search seeds
+silently on its first clean pass, so it won't flood you, and it starts
+contributing comps immediately.
+
+Facebook — add to `SEARCH_URLS` in the userscript. Keep
+`sortBy=creation_time_descend`. More entries means each is visited less
+often (one tab rotates through all of them every 5–15 min), so past four or
+five searches, freshness suffers.
+
+## Troubleshooting
+
+**Facebook changed its DOM.** Symptom: `🚨 BROKEN [facebook]` plus a red
+banner in the tab, or the FB digest line stuck at zero. The scraper
+deliberately depends on one thing only — anchors whose `href` contains
+`/marketplace/item/` — because everything else in FB's markup (class names,
+wrappers, aria labels) churns constantly. To fix: open the pinned search,
+DevTools → Console, and run
+
+```js
+document.querySelectorAll('a[href*="/marketplace/item/"]').length
+```
+
+Zero means the anchor pattern moved; find a listing card, copy its link
+element, and update the selector in `scrapeListings()`. Non-zero while the
+script still warns means the *price/title* extraction broke instead — check
+`a.innerText` on one card: the script expects the price on its own line and
+strips that line from the title, falling back to excising the price by
+regex when everything is glued into one string. FB rows whose year or km
+can't be parsed are stored unscored on purpose, so a partial break degrades
+gracefully rather than producing wrong comps.
+
+**AutoTrader stopped parsing.** `🚨 BROKEN [autotrader/...]`. Run
+`--test`: if it says `NO __NEXT_DATA__`, the site moved off its embedded
+JSON and `parse_listings` needs rewriting; if it says `PROBLEMS: param
+'sort' applied as ...`, the URL format changed again (this already happened
+once — the old `/cars/ab/edmonton/?srt=` format now 301s and drops the
+sort). If the alarm mentions a bot wall, curl the search URL from the
+droplet: a challenge page means the IP is blocked, and the fix is a
+different IP or a slower cadence, not a parser change.
+
+**Alerts went quiet.** Check the digest first — if scan counts look normal
+and rejections are unremarkable, the market is genuinely quiet. If
+`VOLUME DROP` fired, one source is degraded while the other masks it.
+
 ## Shadow mode and the feedback loop
 
 For the first **14 days** after scoring starts, nothing buzzes your phone:
@@ -170,13 +335,50 @@ a guessed comp is worse than no alert. FB listing lifespans are not tracked
 
 ## Database
 
-`listings` (every listing ever seen, with `family`, `fingerprint`,
-`reject_reason`, `z`, `pct_below`, `disappeared_at`), `price_history` (every
-observed price), `models` (cached fit coefficients + comp ranges + fitted_at),
-`alerts` (every real or shadow alert with the coefficients frozen at firing
-time, plus your labels), `scans` (one row per search fetched or ingest batch —
-scan volume the `listings` table can't show, since a cycle that re-sees 20
-known listings inserts nothing), `meta` (seed flags, shadow_until, schedules).
+One SQLite file (`listings.db`, WAL mode). Migrations are idempotent and run
+at startup, so upgrading is just `git pull` + restart.
+
+**`listings`** — every listing ever seen, PK `(source, id)`:
+
+| Column | Meaning |
+|---|---|
+| `source`, `id`, `url` | `autotrader` \| `facebook`; site's own listing id |
+| `title`, `year`, `make`, `model`, `km`, `price` | parsed vehicle facts |
+| `seller_type`, `city`, `distance_km` | `Dealer`/`Private` (AutoTrader only) |
+| `description`, `is_damaged`, `result_type`, `price_label` | `result_type` marks boosted (`Nfm`) rows; `price_label` is the site's own opinion, never used for scoring |
+| `family` | normalized `MAKE:MODELKEY` — the cross-source comp key |
+| `fingerprint` | `family\|year\|km/5000\|price/250` — repost/cross-post key |
+| `reject_reason` | `NULL` = passed every rejection layer; only these become comps |
+| `z`, `pct_below`, `scored_at` | latest score; cleared when the price changes |
+| `first_seen_at`, `last_seen_at` | UTC ISO8601 |
+| `disappeared_at`, `gone_suspected_at`, `last_checked_at` | lifespan tracking; `disappeared_at` needs two confirmations |
+| `km_converted_from_miles` | original miles value when converted |
+| `raw_json` | the full scraped object, so a future column can be backfilled |
+
+**`models`** — one cached fit per family and per segment: `model_key`
+(`family:FORD:F150` / `segment:cars_2k_15k`), `kind`, `b0`/`b1`/`b2`, `mad`,
+`comp_count`, `km_min`/`km_max`/`age_min`/`age_max` (the extrapolation gate's
+bounds), `method` (`theil-sen`/`huber-irls`/`median`), `fitted_at`.
+
+**`alerts`** — one row per alert, real or shadow, `UNIQUE (source, listing_id)`:
+`z`, `pct_below`, `price`, `predicted_price`, `model_key`, the coefficients
+**frozen at firing time** (`b0`,`b1`,`b2`,`mad`,`comp_count`), `is_dealer`,
+`low_confidence`, `shadow`, `fired_at`, and your `label`/`labeled_at`.
+Freezing the coefficients is what makes the weekly precision report
+meaningful — you can tell whether a bad alert came from a bad model or a
+bad listing.
+
+**`price_history`** — every observed price including the first, so the
+original asking price survives later edits.
+
+**`scans`** — one row per search fetched and per ingest batch
+(`scanned_at`, `source`, `search_label`, `parsed_count`, `new_count`).
+`listings` cannot answer "how much did we scan today", because a cycle that
+re-sees twenty known listings inserts nothing; this feeds the digest and the
+volume-drop alarm.
+
+**`meta`** — key/value: per-search seed flags, `shadow_until`, health
+streaks, last-run dates and alarm cooldowns.
 
 Telegram credentials come from environment variables only
 (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`); with them unset the watcher runs

@@ -23,6 +23,7 @@ import random
 import re
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -633,12 +634,20 @@ def format_alert(row, score, predicted_price, shadow, first_seen_at=None):
     return "\n".join(l for l in lines if l)
 
 
+# --test routes every incidental send here instead of the network, so the
+# run can promise exactly one real message.
+_SUPPRESSED_SENDS = None
+
+
 def telegram_send(text):
     """Send a message. Returns True on success.
 
     Catches everything: a Telegram outage, a DNS failure, or a malformed
     payload must never propagate into the poll loop.
     """
+    if _SUPPRESSED_SENDS is not None:
+        _SUPPRESSED_SENDS.append(text)
+        return True
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log("telegram disabled (env vars not set); would send: %.120s" % text)
         return False
@@ -1470,6 +1479,270 @@ def run_watcher():
         time.sleep(sleep_s)
 
 
+def _sandbox_db(real_path):
+    """Snapshot the live DB so --test can score against real comps and models
+    without writing a single row back. Uses the backup API, which is
+    WAL-safe against a running watcher."""
+    tmp_path = os.path.join(
+        tempfile.gettempdir(), "car-scanner-test-%d.db" % os.getpid())
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.remove(tmp_path + suffix)
+        except OSError:
+            pass
+    dest = open_db(tmp_path)
+    if os.path.exists(real_path):
+        src = sqlite3.connect("file:%s?mode=ro" % real_path, uri=True)
+        try:
+            src.backup(dest)
+        finally:
+            src.close()
+    dest.executescript(DDL)
+    dest.commit()
+    return dest, tmp_path
+
+
+def run_test():
+    """One live fetch end to end, against a throwaway copy of the database.
+
+    Prints listings parsed per search, the rejection breakdown, and the top
+    scored listings; sends exactly one Telegram message. The real database
+    is never written to.
+    """
+    global _SUPPRESSED_SENDS
+    conn, tmp_path = _sandbox_db(DB_PATH)
+    _SUPPRESSED_SENDS = []
+    started = datetime.now(timezone.utc)
+    try:
+        migrate_db(conn)
+        migrate_seed_flags(conn)
+        global KNOWN
+        KNOWN = scoring.known_vehicles(conn)
+        base_listings = conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
+        print("=" * 72)
+        print("CAR SCANNER SELF-TEST — live fetch, sandboxed database")
+        print("real db : %s (%d listings, untouched)" % (DB_PATH, base_listings))
+        print("sandbox : %s" % tmp_path)
+        print("=" * 72)
+
+        # Alerts must record but never send; the one real message comes later.
+        meta_set(conn, "shadow_until",
+                 (started + timedelta(days=365)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        for s in SEARCH_URLS:
+            meta_set(conn, seed_key(s["label"]), "1")   # exercise the alert path
+        alerts_before = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+
+        print("\n--- 1. LIVE FETCH ------------------------------------------------")
+        rows_by_label = {}
+        for i, search in enumerate(SEARCH_URLS):
+            if i:
+                time.sleep(random.uniform(*BETWEEN_SEARCHES_S))
+            label = search["label"]
+            t0 = time.time()
+            html, problem = fetch_page(search["url"])
+            if html is None:
+                print("  %-20s FETCH FAILED (%s)" % (label, problem))
+                rows_by_label[label] = []
+                continue
+            page_props = extract_next_data(html)
+            if page_props is None:
+                print("  %-20s NO __NEXT_DATA__ — page structure changed" % label)
+                rows_by_label[label] = []
+                continue
+            rows = parse_listings(page_props, label)
+            problems = verify_search_state(page_props, search["url"], len(rows))
+            rows_by_label[label] = rows
+            print("  %-20s %2d parsed of %s site-wide  %5.1fs  %s" % (
+                label, len(rows), format(page_props.get("numberOfResults") or 0, ","),
+                time.time() - t0,
+                "OK" if not problems else "PROBLEMS: " + "; ".join(problems)))
+
+        all_rows = [r for rows in rows_by_label.values() for r in rows]
+        new_rows = store_listings(conn, all_rows)
+        ids = {(r["source"], r["id"]) for r in all_rows}
+        print("  %d listings fetched (%d unique — searches overlap), %d not "
+              "already in the database" % (len(all_rows), len(ids), len(new_rows)))
+
+        print("\n--- 2. REJECTION BREAKDOWN ---------------------------------------")
+        process_new_rows(conn, new_rows, allow_alerts=True)
+        reasons, clean = {}, 0
+        for src, lid in ids:
+            row = conn.execute(
+                "SELECT reject_reason FROM listings WHERE source=? AND id=?",
+                (src, lid)).fetchone()
+            reason = row["reject_reason"] if row else "not stored"
+            if reason:
+                reasons[reason.split(":", 1)[0]] = reasons.get(reason.split(":", 1)[0], 0) + 1
+            else:
+                clean += 1
+        if reasons:
+            for reason, n in sorted(reasons.items(), key=lambda kv: -kv[1]):
+                print("  %-24s %3d  (%.0f%%)" % (reason, n, 100.0 * n / len(ids)))
+        else:
+            print("  (nothing rejected)")
+        print("  %-24s %3d  (%.0f%%)  eligible for scoring"
+              % ("clean", clean, 100.0 * clean / max(1, len(ids))))
+
+        print("\n--- 3. MODELS ----------------------------------------------------")
+        n_models = scoring.refit_models(conn, utc_now_iso())
+        fams = conn.execute(
+            "SELECT COUNT(*) FROM models WHERE kind='family'").fetchone()[0]
+        segs = conn.execute(
+            "SELECT COUNT(*) FROM models WHERE kind='segment'").fetchone()[0]
+        print("  refit %d models: %d family, %d segment" % (n_models, fams, segs))
+        for m in conn.execute(
+            "SELECT * FROM models ORDER BY kind, comp_count DESC LIMIT 6"
+        ):
+            print("    %-28s n=%-4d mad=%.3f  %s" % (
+                m["model_key"], m["comp_count"], m["mad"], m["method"]))
+
+        print("\n--- 4. TOP SCORED LISTINGS ---------------------------------------")
+        # rescore everything fetched now that models exist
+        for src, lid in ids:
+            row = conn.execute("SELECT * FROM listings WHERE source=? AND id=?",
+                               (src, lid)).fetchone()
+            if not row or row["reject_reason"]:
+                continue
+            score = score_listing(conn, dict(row))
+            if score is None:
+                continue
+            with conn:
+                conn.execute("UPDATE listings SET z=?, pct_below=?, scored_at=?"
+                             " WHERE source=? AND id=?",
+                             (score["z"], score["pct_below"], utc_now_iso(), src, lid))
+        scored = conn.execute(
+            """SELECT * FROM listings WHERE z IS NOT NULL AND scored_at >= ?
+               ORDER BY z ASC LIMIT 10""",
+            (started.strftime("%Y-%m-%dT%H:%M:%SZ"),)).fetchall()
+        would_alert = 0
+        if scored:
+            print("   %-8s %-7s %-6s %-9s %-34s %s"
+                  % ("z", "below", "comps", "price", "vehicle", "verdict"))
+            for row in scored:
+                d = dict(row)
+                score = score_listing(conn, d)
+                if score is None:
+                    continue
+                threshold = (scoring.Z_ALERT_DEALER if d.get("seller_type") == "Dealer"
+                             else scoring.Z_ALERT.get(d["source"], -2.0))
+                if score["suppress"]:
+                    verdict = "gated: " + ",".join(score["suppress"])
+                elif score["z"] <= threshold:
+                    verdict = "would ALERT"
+                    would_alert += 1
+                else:
+                    verdict = "above threshold"
+                print("   %-8.2f %-7s %-6d %-9s %-34s %s" % (
+                    d["z"], "%d%%" % round(d["pct_below"]),
+                    score["model"]["comp_count"], "$" + format(d["price"], ","),
+                    vehicle_line(d)[:34], verdict))
+        else:
+            print("  nothing scored — no family or segment model covers these"
+                  " listings yet (expected on a young database)")
+        recorded = conn.execute(
+            "SELECT COUNT(*) FROM alerts").fetchone()[0] - alerts_before
+        print("  %d of the top %d would alert now; %d alert row(s) were recorded "
+              "during the fetch itself (only brand-new listings can alert)"
+              % (would_alert, len(scored), recorded))
+        print("\n--- 5. COMP READINESS --------------------------------------------")
+        readiness = comp_readiness(conn)
+        for line in readiness:
+            print("  " + line)
+
+        print("\n--- 6. TELEGRAM --------------------------------------------------")
+        suppressed = list(_SUPPRESSED_SENDS)
+        _SUPPRESSED_SENDS = None
+        summary = (
+            "🧪 SELF-TEST %s\n"
+            "Fetched %d listings across %d searches (%d new).\n"
+            "Rejected %d (%s); %d clean.\n"
+            "Models: %d family, %d segment. Would-fire alerts: %d.\n"
+            "%d incidental warnings were suppressed during the test.\n"
+            "The real database was not written to."
+            % (started.strftime("%Y-%m-%d %H:%M UTC"), len(all_rows),
+               len(SEARCH_URLS), len(new_rows), sum(reasons.values()),
+               ", ".join("%s %d" % kv for kv in sorted(reasons.items())) or "none",
+               clean, fams, segs, would_alert, len(suppressed)))
+        ok = telegram_send(summary)
+        print("  sent exactly 1 message: %s" % ("yes" if ok else
+              "NO — Telegram not configured (message printed above/below)"))
+        if not ok:
+            print("  " + summary.replace("\n", "\n  "))
+        if suppressed:
+            print("  suppressed during test: %s"
+                  % "; ".join(s.split("\n")[0][:60] for s in suppressed))
+        print("\n" + "=" * 72)
+        print("Real database untouched: %s" % DB_PATH)
+        print("=" * 72)
+    finally:
+        _SUPPRESSED_SENDS = None
+        try:
+            conn.close()
+        except Exception:
+            pass
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(tmp_path + suffix)
+            except OSError:
+                pass
+
+
+def comp_readiness(conn):
+    """How close each family is to being trustworthy, and how fast it's growing."""
+    out = []
+    fam_counts = conn.execute(
+        """SELECT family, COUNT(*) AS n FROM listings
+           WHERE family IS NOT NULL AND reject_reason IS NULL
+             AND COALESCE(is_damaged,0)=0 AND year IS NOT NULL
+             AND km IS NOT NULL AND price IS NOT NULL
+           GROUP BY family ORDER BY n DESC""").fetchall()
+    if not fam_counts:
+        return ["no clean comps stored yet"]
+    ge8 = sum(1 for f in fam_counts if f["n"] >= scoring.MIN_COMPS_GATE)
+    ge30 = sum(1 for f in fam_counts if f["n"] >= scoring.FAMILY_MODEL_MIN_COMPS)
+    out.append("%d families with clean comps; %d have >=%d (gate), %d have >=%d "
+               "(own model)" % (len(fam_counts), ge8, scoring.MIN_COMPS_GATE,
+                                ge30, scoring.FAMILY_MODEL_MIN_COMPS))
+    out.append("largest: " + ", ".join("%s %d" % (f["family"].split(":", 1)[-1], f["n"])
+                                       for f in fam_counts[:6]))
+    # Arrival rate must exclude the seeding burst: the first cycle stores a
+    # whole page at once, and extrapolating that gives absurd projections.
+    first = conn.execute(
+        "SELECT MIN(first_seen_at) FROM listings").fetchone()[0]
+    if not first:
+        return out
+    try:
+        seed_end = (datetime.strptime(first, "%Y-%m-%dT%H:%M:%SZ")
+                    + timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError):
+        return out
+    post = conn.execute(
+        """SELECT COUNT(*) AS n, MAX(first_seen_at) AS last FROM listings
+           WHERE reject_reason IS NULL AND first_seen_at > ?""", (seed_end,)).fetchone()
+    try:
+        hours = (datetime.strptime(post["last"], "%Y-%m-%dT%H:%M:%SZ")
+                 - datetime.strptime(seed_end, "%Y-%m-%dT%H:%M:%SZ")).total_seconds() / 3600.0
+    except (TypeError, ValueError):
+        hours = 0.0
+    if hours < 2.0 or not post["n"]:
+        out.append("not enough post-seed history to measure the arrival rate yet "
+                   "(need a few hours of running; the first cycle's burst would "
+                   "skew any estimate)")
+        return out
+    per_day = post["n"] / hours * 24
+    out.append("clean comps arriving at ~%.0f/day (measured over %.1fh after the "
+               "seed cycle)" % (per_day, hours))
+    biggest = fam_counts[0]
+    need = max(0, scoring.FAMILY_MODEL_MIN_COMPS - biggest["n"])
+    total_clean = sum(f["n"] for f in fam_counts)
+    share = biggest["n"] / float(total_clean) if total_clean else 0
+    if need and per_day * share > 0:
+        out.append("%s needs ~%d more comps: ~%.0f days at its share of that rate"
+                   % (biggest["family"].split(":", 1)[-1], need,
+                      need / (per_day * share)))
+    return out
+
+
 def label_alert(alert_id, label):
     valid = ("good", "bad", "scam", "already_gone")
     if label not in valid:
@@ -1503,7 +1776,13 @@ def main():
                    help="send the daily digest now and exit")
     p.add_argument("--report", action="store_true",
                    help="send the weekly report now and exit")
+    p.add_argument("--test", action="store_true",
+                   help="one live fetch end to end against a sandboxed copy of "
+                        "the database; sends exactly one Telegram message")
     args = p.parse_args()
+    if args.test:
+        run_test()
+        return
     if args.label:
         raise SystemExit(label_alert(args.label[0], args.label[1]))
     if args.digest or args.report:
