@@ -165,14 +165,18 @@ def verify_search_state(page_props, expected_url, parsed_count):
 
 
 def parse_km(s):
-    if not s:
+    if s is None:
         return None
-    digits = re.sub(r"[^\d]", "", s)
+    if isinstance(s, (int, float)):
+        return int(s)
+    digits = re.sub(r"[^\d]", "", str(s))
     return int(digits) if digits else None
 
 
 def strip_html(s):
-    return TAG_RE.sub(" ", s).strip() if s else None
+    if not isinstance(s, str):
+        return None
+    return TAG_RE.sub(" ", s).strip() or None
 
 
 def parse_listings(page_props, search_label):
@@ -267,7 +271,11 @@ def init_db(path):
 
 
 def store_listings(conn, rows):
-    """Upsert rows; returns the subset that are brand new (never seen before)."""
+    """Upsert rows; returns the subset that are brand new (never seen before).
+
+    Every observed price lands in price_history (including the first), so the
+    original asking price survives later in-place updates of listings.price.
+    """
     now = utc_now_iso()
     new_rows = []
     with conn:
@@ -290,6 +298,11 @@ def store_listings(conn, rows):
                      r["city"], r["distance_km"], r["description"], r["is_damaged"],
                      r["result_type"], r["price_label"], r["search_label"],
                      now, now, r["raw_json"]),
+                )
+                conn.execute(
+                    "INSERT INTO price_history (source, id, price, seen_at)"
+                    " VALUES (?,?,?,?)",
+                    (r["source"], r["id"], r["price"], now),
                 )
                 new_rows.append(r)
             else:
@@ -368,53 +381,73 @@ def warn_search_broken(conn, label, problems):
                 return
         except ValueError:
             pass
-    telegram_send(
+    sent = telegram_send(
         "WARNING [autotrader/%s] search looks broken; notifications suppressed "
         "this cycle:\n- %s" % (label, "\n- ".join(problems))
     )
-    meta_set(conn, key, utc_now_iso())
+    if sent:  # a failed send must not consume the cooldown — retry next cycle
+        meta_set(conn, key, utc_now_iso())
 
 
 def poll_once(conn, notifications_enabled):
+    """One pass over all searches. Returns {label: parsed_count} for the pass.
+
+    Each search body is exception-isolated so a transient DB error on one
+    search can't skip the others.
+    """
+    parsed_counts = {}
     for i, search in enumerate(SEARCH_URLS):
         if i > 0:
             time.sleep(random.uniform(*BETWEEN_SEARCHES_S))
         label, url = search["label"], search["url"]
-        html = fetch_page(url)
-        if html is None:
-            log("[%s] fetch failed after retries" % label)
-            continue
-        page_props = extract_next_data(html)
-        if page_props is None:
-            log("[%s] no __NEXT_DATA__ found — page structure changed?" % label)
-            warn_search_broken(conn, label, ["__NEXT_DATA__ missing from page"])
-            continue
-        rows = parse_listings(page_props, label)
-        problems = verify_search_state(page_props, url, parsed_count=len(rows))
-        new_rows = store_listings(conn, rows)  # comp data is comp data — always store
-        if problems:
-            log("[%s] search-state problems: %s" % (label, "; ".join(problems)))
-            warn_search_broken(conn, label, problems)
-            continue  # precision over recall: no per-listing pings off a sick search
-        log("[%s] parsed %d listings (%d new) of %s total"
-            % (label, len(rows), len(new_rows), page_props.get("numberOfResults")))
-        if notifications_enabled:
-            for r in new_rows:
-                telegram_send(format_new_listing(r))
-                time.sleep(1.0)  # stay under Telegram rate limits
+        try:
+            html = fetch_page(url)
+            if html is None:
+                log("[%s] fetch failed after retries" % label)
+                continue
+            page_props = extract_next_data(html)
+            if page_props is None:
+                log("[%s] no __NEXT_DATA__ found — page structure changed?" % label)
+                warn_search_broken(conn, label, ["__NEXT_DATA__ missing from page"])
+                continue
+            rows = parse_listings(page_props, label)
+            problems = verify_search_state(page_props, url, parsed_count=len(rows))
+            new_rows = store_listings(conn, rows)  # comp data is comp data — always store
+            if problems:
+                log("[%s] search-state problems: %s" % (label, "; ".join(problems)))
+                warn_search_broken(conn, label, problems)
+                continue  # precision over recall: no per-listing pings off a sick search
+            parsed_counts[label] = len(rows)
+            log("[%s] parsed %d listings (%d new) of %s total"
+                % (label, len(rows), len(new_rows), page_props.get("numberOfResults")))
+            if notifications_enabled:
+                for r in new_rows:
+                    telegram_send(format_new_listing(r))
+                    time.sleep(1.0)  # stay under Telegram rate limits
+        except Exception as e:
+            log("[%s] search failed: %s" % (label, e))
+    return parsed_counts
 
 
 def main():
     log("starting autotrader watcher; db=%s" % DB_PATH)
     conn = init_db(DB_PATH)
-    count = conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
-    if count == 0:
-        # Seed mode: first ever run stores current inventory without notifying,
-        # so boot doesn't flood Telegram with 60 "new" listings.
-        log("empty database — seeding without notifications")
-        poll_once(conn, notifications_enabled=False)
-        log("seeded %d listings"
-            % conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0])
+    # Seed mode: notifications stay off until one full pass has parsed every
+    # search cleanly, recorded via an explicit meta flag. Inferring seed state
+    # from row count would flood Telegram after a partial seed + restart, or
+    # after a first boot where the network wasn't up yet.
+    while meta_get(conn, "seeded") != "1":
+        try:
+            counts = poll_once(conn, notifications_enabled=False)
+            if all(counts.get(s["label"]) for s in SEARCH_URLS):
+                meta_set(conn, "seeded", "1")
+                log("seeded %d listings — notifications enabled"
+                    % conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0])
+                break
+            log("seed pass incomplete (%s) — retrying next cycle" % (counts,))
+        except Exception as e:
+            log("seed pass failed: %s" % e)
+        time.sleep(POLL_INTERVAL_BASE_S + random.uniform(0, POLL_JITTER_S))
     while True:
         sleep_s = POLL_INTERVAL_BASE_S + random.uniform(0, POLL_JITTER_S)
         log("sleeping %.0fs" % sleep_s)

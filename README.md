@@ -17,7 +17,9 @@ price.
 ## Install (droplet)
 
 ```sh
-apt install python3-pip && pip3 install requests beautifulsoup4
+apt update && apt install -y python3-requests python3-bs4
+# (Debian 12 / Ubuntu 23.04+ block bare pip3 installs — PEP 668. If you'd
+#  rather use pip, make a venv and point the unit's ExecStart at its python.)
 mkdir -p /opt/car-scanner && cp autotrader_watcher.py /opt/car-scanner/
 cp car-scanner.env.example /etc/car-scanner.env  # fill in real values
 chmod 600 /etc/car-scanner.env
@@ -33,9 +35,14 @@ and stores listings but only logs what it would have sent.
 
 ## Install (browser)
 
-Install the userscript in Tampermonkey, pin a tab on any
-`facebook.com/marketplace` page, and enter the Telegram token/chat ID when
-prompted once (stored in Tampermonkey storage, never in the file).
+Install the userscript in Tampermonkey, then pin a tab and open the **first
+URL from `SEARCH_URLS`** in it — the watcher only activates on its own
+configured searches, so ordinary Marketplace browsing in other tabs is left
+untouched (no alerts from recommendation feeds, no surprise redirects). Enter
+the Telegram token/chat ID when prompted (stored in Tampermonkey storage,
+never in the file; change later via the Tampermonkey menu → "Set Telegram
+credentials"). Each search seeds silently on its first clean scan, so neither
+install nor the first rotations flood Telegram.
 
 **One-time manual check (can't be automated):** open each of the four search
 URLs from the top of the userscript while logged in, and confirm results are
