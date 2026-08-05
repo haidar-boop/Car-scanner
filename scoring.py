@@ -247,11 +247,15 @@ def assess(row, now_year):
 # --- FB title parsing -------------------------------------------------------
 
 YEAR_RE = re.compile(r"\b(19[89]\d|20[0-2]\d)\b")
-MILES_RE = re.compile(r"([\d][\d,\.]*)\s*(?:miles|mi)\b", re.I)
-KM_FULL_RE = re.compile(r"(\d{1,3}(?:[,\s]\d{3})+|\d{4,6})\s*(?:km|kms)\b", re.I)
-K_KM_RE = re.compile(r"(\d{2,3})\s*k\s*(?:km|kms)\b", re.I)
+MILES_RE = re.compile(r"\b([\d][\d,\.]*)\s*(?:miles|mi)\b", re.I)
+# Left \b is load-bearing: without it, a digit token before the mileage
+# ("4x4 185,000 km", "V8 120,000 km") merges into the capture and the row
+# is falsely rejected km_too_high.
+KM_FULL_RE = re.compile(r"\b(\d{1,3}(?:[,\s]\d{3})+|\d{4,6})\s*(?:km|kms)\b", re.I)
+K_KM_RE = re.compile(r"\b(\d{2,3})\s*k\s*(?:km|kms)\b", re.I)
 K_BARE_RE = re.compile(r"\b(\d{2,3})k\b", re.I)
 ODO_CONTEXT_RE = re.compile(r"\b(km|kms|odometer|mileage|kilometers|kilometres)\b", re.I)
+PRICE_CONTEXT_RE = re.compile(r"\b(obo|firm|asking|neg(?:otiable)?|cash|trade)\b|\$", re.I)
 
 
 def parse_year_from_text(text):
@@ -276,36 +280,47 @@ def parse_km_text(text):
     m = K_KM_RE.search(text)
     if m:
         return int(m.group(1)) * 1000, None
-    # bare "185k" only counts when odometer context appears elsewhere;
-    # otherwise it's ambiguous (could be a price) and km stays unknown
+    # Bare "185k" is ambiguous — it's an asking price at least as often as an
+    # odometer ("15k obo"). Price-ish words adjacent to the number always win
+    # (a global "low kms!" elsewhere must not turn the price into mileage);
+    # only with no price context nearby AND odometer context in the text do
+    # we read it as km. Otherwise km stays unknown -> store-only.
     m = K_BARE_RE.search(text)
-    if m and ODO_CONTEXT_RE.search(text):
-        return int(m.group(1)) * 1000, None
+    if m:
+        nearby = text[max(0, m.start() - 10):m.start()] + " " + text[m.end():m.end() + 12]
+        if PRICE_CONTEXT_RE.search(nearby):
+            return None, None
+        if ODO_CONTEXT_RE.search(text):
+            return int(m.group(1)) * 1000, None
     return None, None
 
 
-def find_make(text, known_makes):
+def _find_make_span(text, known_makes):
+    """Returns (canonical_make, text_after_the_matched_token). The matched
+    token may be an alias ('chevy'), so the caller must use the returned
+    after-text — searching for the canonical name would find nothing."""
     if not text:
-        return None
-    norm = re.sub(r"[^A-Z0-9 ]", " ", text.upper())
-    norm = " %s " % re.sub(r"\s+", " ", norm)
-    for alias, canon in MAKE_ALIASES.items():
-        if " %s " % alias in norm:
-            return canon
-    for make in sorted(known_makes, key=len, reverse=True):
-        if " %s " % make in norm:
-            return make
-    return None
+        return None, ""
+    norm = " %s " % re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9 ]", " ", text.upper()))
+    candidates = [(a, c) for a, c in MAKE_ALIASES.items()]
+    candidates += [(m, m) for m in known_makes]
+    for token, canon in sorted(candidates, key=lambda t: len(t[0]), reverse=True):
+        needle = " %s " % token.replace("-", " ")
+        i = norm.find(needle)
+        if i >= 0:
+            return canon, norm[i + len(needle):]
+    return None, ""
 
 
-def find_model(text, make, models_for_make):
-    """Longest-prefix match of the text after the make against known families."""
-    if not text or not models_for_make:
+def find_make(text, known_makes):
+    return _find_make_span(text, known_makes)[0]
+
+
+def find_model(after_text, models_for_make):
+    """Longest-prefix match of the text following the make token."""
+    if not after_text or not models_for_make:
         return None
-    upper = re.sub(r"[^A-Z0-9]", " ", text.upper())
-    idx = upper.find(make.replace("-", " ")) if make else -1
-    after = upper[idx + len(make):] if idx >= 0 else upper
-    norm = re.sub(r"[^A-Z0-9]", "", after)
+    norm = re.sub(r"[^A-Z0-9]", "", after_text.upper())
     for modelkey in sorted(models_for_make, key=len, reverse=True):
         if norm.startswith(modelkey):
             return modelkey
@@ -348,8 +363,10 @@ def parse_fb_listing(item, known, now_iso):
         except ValueError:
             price = None
     km, miles = parse_km_text(text)
-    make = find_make(text, known["makes"])
-    modelkey = find_model(text, make, known["models_by_make"].get(make)) if make else None
+    if km is not None and price is not None and abs(km - price) <= max(500, price * 0.02):
+        km, miles = None, None  # almost certainly the price echoed as mileage
+    make, after = _find_make_span(text, known["makes"])
+    modelkey = find_model(after, known["models_by_make"].get(make)) if make else None
     return {
         "id": listing_id,
         "source": "facebook",
@@ -477,9 +494,13 @@ def gate(model_row, age, km, now_iso, kind):
     return problems
 
 
+# family IS NOT NULL is load-bearing beyond the family query: a row the
+# rejection layer never ran on has reject_reason NULL *and* family NULL, and
+# must not slip into segment fits as a "clean" comp.
 COMP_SQL = """
 SELECT year, km, price, first_seen_at FROM listings
-WHERE {where} AND reject_reason IS NULL AND COALESCE(is_damaged, 0) = 0
+WHERE {where} AND reject_reason IS NULL AND family IS NOT NULL
+  AND COALESCE(is_damaged, 0) = 0
   AND year IS NOT NULL AND km IS NOT NULL AND price IS NOT NULL
   AND km > 0 AND price > 0 AND first_seen_at >= ?
 """
@@ -641,10 +662,26 @@ def _selftest():
     check("bare 185k ambiguous", parse_km_text("f150 185k firm")[0] is None)
     km, miles = parse_km_text("only 120,000 miles")
     check("miles converted", km == 193_120 and miles == 120_000)
-    known = {"makes": set(STATIC_MAKES), "models_by_make": {"FORD": {"F150", "FOCUS"}}}
+    # digit tokens before the mileage must not merge into it
+    check("4x4 before km", parse_km_text("2014 Ford F-150 4x4 185,000 km")[0] == 185_000)
+    check("V8 before km", parse_km_text("F-150 V8 120,000 km")[0] == 120_000)
+    check("year before km", parse_km_text("Honda Civic 2014 185,000 km")[0] == 185_000)
+    # a bare-k asking price must not become the odometer just because
+    # "kms" appears somewhere else in the title
+    check("15k obo not km", parse_km_text("2014 F-150 XLT 15k obo, low kms!")[0] is None)
+    check("asking 25k not km", parse_km_text("asking 25k firm. kms are low")[0] is None)
+    check("185k with odo ctx", parse_km_text("185k on it, low kms, runs mint")[0] == 185_000)
+    known = {"makes": set(STATIC_MAKES),
+             "models_by_make": {"FORD": {"F150", "FOCUS"},
+                                "CHEVROLET": {"SILVERADO", "CRUZE"}}}
     check("find make", find_make("2014 ford f-150 xlt", known["makes"]) == "FORD")
-    check("find model", find_model("2014 ford f-150 xlt low kms", "FORD",
-                                   known["models_by_make"]["FORD"]) == "F150")
+    mk, after = _find_make_span("2014 ford f-150 xlt low kms", known["makes"])
+    check("find model", mk == "FORD"
+          and find_model(after, known["models_by_make"]["FORD"]) == "F150")
+    # aliased makes must still resolve the model from the after-text
+    mk, after = _find_make_span("2014 chevy silverado 1500 lt", known["makes"])
+    check("alias make", mk == "CHEVROLET")
+    check("alias model", find_model(after, known["models_by_make"]["CHEVROLET"]) == "SILVERADO")
     row = parse_fb_listing(
         {"id": "123456789", "price_text": "CA$9,500",
          "text": "2014 Ford F-150 XLT 185,000 km", "label": "trucks_5k_30k"},
@@ -652,6 +689,12 @@ def _selftest():
     check("fb parse full", row["price"] == 9500 and row["year"] == 2014
           and row["make"] == "FORD" and row["model"] == "F150"
           and row["km"] == 185_000)
+    # km that echoes the price is discarded (store-only), not trusted
+    row = parse_fb_listing(
+        {"id": "123456780", "price_text": "$15,000",
+         "text": "2012 Ford F-150 15k low kms great truck", "label": "trucks_5k_30k"},
+        known, "2026-08-05T00:00:00Z")
+    check("price-echo km dropped", row["km"] is None)
 
     # robust fit on contaminated synthetic comps
     rng = np.random.default_rng(42)

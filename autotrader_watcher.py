@@ -313,6 +313,7 @@ STEP2_COLUMNS = {
     "scored_at": "TEXT",
     "disappeared_at": "TEXT",
     "last_checked_at": "TEXT",
+    "gone_suspected_at": "TEXT",         # first strike of the 2-check gone test
     "km_converted_from_miles": "INTEGER",
 }
 
@@ -427,11 +428,25 @@ def store_listings(conn, rows):
                         " VALUES (?,?,?,?)",
                         (r["source"], r["id"], r["price"], now),
                     )
-                conn.execute(
-                    "UPDATE listings SET last_seen_at=?, price=?, raw_json=?"
-                    " WHERE source=? AND id=?",
-                    (now, r["price"], r["raw_json"], r["source"], r["id"]),
-                )
+                    # A changed price must pass the rejection layer again —
+                    # an edit to $111 would otherwise sit in the comp pool as
+                    # a clean row forever. The stale score is cleared too.
+                    family, fp, reason = scoring.assess(
+                        r, datetime.now(timezone.utc).year)
+                    conn.execute(
+                        "UPDATE listings SET last_seen_at=?, price=?, raw_json=?,"
+                        " family=?, fingerprint=?, reject_reason=?,"
+                        " z=NULL, pct_below=NULL, scored_at=NULL"
+                        " WHERE source=? AND id=?",
+                        (now, r["price"], r["raw_json"], family, fp, reason,
+                         r["source"], r["id"]),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE listings SET last_seen_at=?, raw_json=?"
+                        " WHERE source=? AND id=?",
+                        (now, r["raw_json"], r["source"], r["id"]),
+                    )
     return new_rows
 
 
@@ -693,7 +708,11 @@ def poll_once(conn):
             if problems:
                 log("[%s] search-state problems: %s" % (label, "; ".join(problems)))
                 warn_search_broken(conn, label, problems)
-                continue  # precision over recall: no per-listing pings off a sick search
+                # Still assess+score the rows (they'd otherwise sit unassessed
+                # until the next restart's backfill) — just never alert off a
+                # search that failed verification.
+                process_new_rows(conn, new_rows, allow_alerts=False)
+                continue
             parsed_counts[label] = len(rows)
             log("[%s] parsed %d listings (%d new) of %s total"
                 % (label, len(rows), len(new_rows), page_props.get("numberOfResults")))
@@ -844,16 +863,24 @@ def maybe_weekly_report(conn):
         meta_set(conn, "last_weekly_date", today)
 
 
-def listing_gone(resp, listing_id):
-    """A dead AutoTrader listing 200-redirects off its /offers/ URL to a
-    generic search page (verified live), so losing the id from the final URL
-    is the primary signal; 404/410 and removal phrases are backup."""
+def classify_listing_check(resp, listing_id):
+    """'alive' | 'gone' | 'unknown' for one lifespan probe.
+
+    A dead AutoTrader listing 200-redirects off its /offers/ URL to a generic
+    search page (verified live), so losing the id from the final URL is the
+    primary gone signal; 404/410 and removal phrases are backup. Anything
+    else (403/429/5xx bot challenges, outages) is 'unknown' — a transient
+    hiccup must never look like a sale."""
     if resp.status_code in (404, 410):
-        return True
+        return "gone"
+    if resp.status_code != 200:
+        return "unknown"
     if listing_id not in resp.url:
-        return True
-    return bool(re.search(r"no longer available|listing (has )?expired",
-                          resp.text[:200000], re.I))
+        return "gone"
+    if re.search(r"no longer available|listing (has )?expired",
+                 resp.text[:200000], re.I):
+        return "gone"
+    return "alive"
 
 
 def recheck_listings(conn):
@@ -866,7 +893,7 @@ def recheck_listings(conn):
     """
     now = datetime.now(timezone.utc)
     rows = conn.execute(
-        """SELECT l.source, l.id, l.url,
+        """SELECT l.source, l.id, l.url, l.gone_suspected_at,
                   EXISTS(SELECT 1 FROM alerts a WHERE a.source = l.source
                          AND a.listing_id = l.id) AS alerted
            FROM listings l
@@ -885,18 +912,32 @@ def recheck_listings(conn):
             resp = requests.get(
                 r["url"], timeout=FETCH_TIMEOUT_S, allow_redirects=True,
                 headers={"User-Agent": USER_AGENT, "Accept-Language": "en-CA,en;q=0.9"})
-            gone = listing_gone(resp, r["id"])
+            verdict = classify_listing_check(resp, r["id"])
         except requests.RequestException:
-            gone = None  # network trouble is not evidence of removal
+            verdict = "unknown"  # network trouble is not evidence of removal
         checked_at = utc_now_iso()
+        # disappeared_at is irreversible and feeds the sold-fast signal, so
+        # "gone" must be observed on two checks >= 6h apart before it sticks;
+        # "unknown" leaves the suspicion state untouched.
         with conn:
-            if gone:
+            if verdict == "gone" and r["gone_suspected_at"]:
                 conn.execute(
                     "UPDATE listings SET last_checked_at=?, disappeared_at=?"
                     " WHERE source=? AND id=?",
                     (checked_at, checked_at, r["source"], r["id"]))
-                log("[lifespan] %s/%s disappeared" % (r["source"], r["id"]))
-            elif gone is not None:
+                log("[lifespan] %s/%s disappeared (confirmed on 2nd check)"
+                    % (r["source"], r["id"]))
+            elif verdict == "gone":
+                conn.execute(
+                    "UPDATE listings SET last_checked_at=?, gone_suspected_at=?"
+                    " WHERE source=? AND id=?",
+                    (checked_at, checked_at, r["source"], r["id"]))
+            elif verdict == "alive":
+                conn.execute(
+                    "UPDATE listings SET last_checked_at=?, gone_suspected_at=NULL"
+                    " WHERE source=? AND id=?",
+                    (checked_at, r["source"], r["id"]))
+            else:
                 conn.execute(
                     "UPDATE listings SET last_checked_at=? WHERE source=? AND id=?",
                     (checked_at, r["source"], r["id"]))
@@ -916,6 +957,7 @@ def run_scheduled_tasks(conn):
 
 class IngestHandler(BaseHTTPRequestHandler):
     server_version = "CarScanner"
+    timeout = 20  # socket read timeout; a slow-drip client can't hold a thread
 
     def log_message(self, fmt, *args):
         pass  # no client-controlled format strings in our logs
@@ -939,7 +981,12 @@ class IngestHandler(BaseHTTPRequestHandler):
             length = self.headers.get("Content-Length")
             if length is None:
                 return self._reply(411, {"ok": False})
-            length = int(length)
+            try:
+                length = int(length)
+            except ValueError:
+                return self._reply(400, {"ok": False})
+            if length < 0:
+                return self._reply(400, {"ok": False})  # read(-1) = until EOF
             if length > INGEST_MAX_BODY:
                 return self._reply(413, {"ok": False})
             try:
@@ -993,6 +1040,7 @@ def start_ingest_server():
     host, _, port = INGEST_BIND.rpartition(":")
     try:
         server = ThreadingHTTPServer((host or "0.0.0.0", int(port)), IngestHandler)
+        server.daemon_threads = True
     except Exception as e:
         log("ingest server failed to start on %s: %s" % (INGEST_BIND, e))
         return None

@@ -54,7 +54,10 @@
   // --------------------------------------------------------------------------
 
   const ITEM_ID_RE = /\/marketplace\/item\/(\d+)/;
-  const PRICE_RE = /(?:CA\s?\$|C\$|\$)\s?([\d,]+)/;
+  // Comma-grouped capture is load-bearing: textContent glues FB's price and
+  // title nodes with no separator ("CA$9,5002014 Ford..."), and a naive
+  // [\d,]+ would swallow the title's year into the price.
+  const PRICE_RE = /(?:CA\s?\$|C\$|\$)\s?(\d{1,3}(?:,\d{3})*)/;
 
   // The watcher only ever acts on its own configured searches. Any other
   // marketplace page — homepage, item pages, the user's own browsing tabs —
@@ -147,6 +150,17 @@
   function bufferListing(item) {
     const buf = GM_getValue("ingest_buffer", []);
     buf.push(item);
+    if (buf.length > INGEST_BUFFER_CAP) {
+      // Cap overflow means the droplet has been unreachable for a long time
+      // and unsent listings are now being lost — that's an outage, say so.
+      console.warn("[car-watcher] ingest buffer full — dropping oldest unsent listings");
+      const lastWarn = GM_getValue("buffer_warned_at", 0);
+      if (Date.now() - lastWarn > WARN_COOLDOWN_MS) {
+        GM_setValue("buffer_warned_at", Date.now());
+        telegramSend("WARNING [facebook] ingest buffer overflowing — droplet " +
+                     "unreachable? Oldest scraped listings are being dropped.");
+      }
+    }
     GM_setValue("ingest_buffer", buf.slice(-INGEST_BUFFER_CAP));
     flushIngest();
   }
@@ -264,12 +278,30 @@
       const m = a.href.match(ITEM_ID_RE);
       if (!m || seen.has(m[1])) continue;
       seen.add(m[1]);
-      const text = (a.textContent || "").trim();
-      const priceMatch = text.match(PRICE_RE);
+      // innerText keeps FB's node boundaries as newlines; the price sits on
+      // its own line. Strip that line from the title text so the droplet's
+      // year/km parsers see "2014 Ford F-150...", not "CA$9,5002014 Ford...".
+      const raw = (a.innerText || a.textContent || "").trim();
+      const lines = raw.split("\n").map((s) => s.trim()).filter(Boolean);
+      let price = null;
+      const titleParts = [];
+      for (const line of (lines.length > 1 ? lines : [raw])) {
+        const pm = line.match(PRICE_RE);
+        if (pm && price === null) {
+          price = pm[1];
+          if (lines.length > 1) continue; // drop the price line from the title
+        }
+        titleParts.push(line);
+      }
+      let text = titleParts.join(" ");
+      if (lines.length <= 1 && price !== null) {
+        text = raw.replace(PRICE_RE, " "); // glued fallback: excise the price
+      }
+      text = text.replace(/\s+/g, " ").trim();
       out.push({
         id: m[1],
         url: "https://www.facebook.com/marketplace/item/" + m[1],
-        price: priceMatch ? priceMatch[1] : null,
+        price: price,
         text: text.slice(0, 200),
       });
     }
