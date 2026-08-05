@@ -352,6 +352,18 @@ CREATE TABLE IF NOT EXISTS alerts (
     UNIQUE (source, listing_id)
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_fired ON alerts(fired_at);
+
+-- One row per search fetched (and per ingest batch), so the daily digest can
+-- report scan volume even for listings already seen. Step 4's partial-breakage
+-- alarm reads trailing averages from here.
+CREATE TABLE IF NOT EXISTS scans (
+    scanned_at   TEXT NOT NULL,
+    source       TEXT NOT NULL,
+    search_label TEXT NOT NULL,
+    parsed_count INTEGER NOT NULL,
+    new_count    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scans_at ON scans(scanned_at);
 """
 
 
@@ -464,30 +476,68 @@ def meta_set(conn, key, value):
         )
 
 
-def format_alert(row, score, predicted_price, shadow):
-    # Minimal deal format; Step 3 rebuilds this properly.
-    flags = ""
-    if score["low_confidence"]:
-        flags += " [LOW CONF]"
-    if row.get("seller_type") == "Dealer":
-        flags += " [DEALER]"
-    if shadow:
-        flags += " [SHADOW]"
+def minutes_since(iso_str):
+    if not iso_str:
+        return None
+    try:
+        seen = datetime.strptime(iso_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+    return max(0, int((datetime.now(timezone.utc) - seen).total_seconds() // 60))
+
+
+def format_age(minutes):
+    """'seen' age, not true posting age — neither site exposes when a listing
+    was actually posted, so this measures how long WE have known about it."""
+    if minutes is None:
+        return "age n/a"
+    if minutes < 60:
+        return "seen %dm ago" % minutes
+    if minutes < 60 * 24:
+        return "seen %.0fh ago" % (minutes / 60.0)
+    return "seen %.0fd ago" % (minutes / 1440.0)
+
+
+def vehicle_line(row):
+    ymm = " ".join(str(p) for p in (row.get("year"), row.get("make"), row.get("model")) if p)
+    return ymm or (row.get("title") or "(unidentified)")
+
+
+def format_alert(row, score, predicted_price, shadow, first_seen_at=None):
+    """Decision-relevant numbers first — the opening line is what shows in a
+    phone notification, so it carries discount, z, price and the vehicle."""
     km = "%s km" % format(row["km"], ",") if row.get("km") is not None else "km n/a"
-    return (
-        "DEAL [%s/%s] z=%.1f | %d%% below predicted $%s (%d comps)%s\n"
-        "%s — $%s — %s — %s, %s\n%s" % (
-            row["source"], row["search_label"], score["z"], round(score["pct_below"]),
-            format(predicted_price, ","), score["model"]["comp_count"], flags,
-            row.get("title") or "(no title)", format(row["price"], ","), km,
-            row.get("seller_type") or "seller n/a", row.get("city") or "city n/a",
-            row.get("url") or "",
-        )
+    head = "%s%d%% below · z=%.1f · $%s · %s" % (
+        "[SHADOW] " if shadow else "⚡ ",
+        round(score["pct_below"]), score["z"],
+        format(row["price"], ","), vehicle_line(row),
     )
+    lines = [
+        head,
+        "predicted $%s from %d comps (%s)" % (
+            format(predicted_price, ","), score["model"]["comp_count"],
+            score["model"]["model_key"].split(":", 1)[-1]),
+        "%s · %s · %s · %s" % (
+            km, row.get("seller_type") or "seller n/a",
+            row.get("city") or "city n/a", format_age(minutes_since(first_seen_at))),
+    ]
+    marks = []
+    if score["low_confidence"]:
+        marks.append("⚠️ LOW CONFIDENCE — segment model, too few comps for this family")
+    if row.get("seller_type") == "Dealer":
+        marks.append("🏪 DEALER — priced by a pro, check for a catch")
+    if marks:
+        lines.append(" · ".join(marks))
+    lines.append(row.get("url") or "")   # URL last so it stays tappable
+    return "\n".join(l for l in lines if l)
 
 
 def telegram_send(text):
-    """Send a message. Returns True on success; never raises, never kills the loop."""
+    """Send a message. Returns True on success.
+
+    Catches everything: a Telegram outage, a DNS failure, or a malformed
+    payload must never propagate into the poll loop.
+    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log("telegram disabled (env vars not set); would send: %.120s" % text)
         return False
@@ -505,9 +555,22 @@ def telegram_send(text):
             log("telegram HTTP %d: %.200s" % (resp.status_code, resp.text))
             return False
         return True
-    except requests.RequestException as e:
+    except Exception as e:
         log("telegram send failed: %s" % e)
         return False
+
+
+def record_scan(conn, source, search_label, parsed_count, new_count):
+    """Scan volume for the digest — listings alone can't show it, since a
+    cycle that re-sees 20 known listings inserts no rows."""
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO scans (scanned_at, source, search_label,"
+                " parsed_count, new_count) VALUES (?,?,?,?,?)",
+                (utc_now_iso(), source, search_label, parsed_count, new_count))
+    except Exception as e:
+        log("record_scan failed: %s" % e)
 
 
 def warn_search_broken(conn, label, problems):
@@ -611,7 +674,11 @@ def maybe_alert(conn, row, score):
         % (" shadow" if shadow else "", cur.lastrowid, src, lid,
            score["z"], round(score["pct_below"]), predicted))
     if not shadow:
-        telegram_send(format_alert(row, score, predicted, shadow))
+        seen_row = conn.execute(
+            "SELECT first_seen_at FROM listings WHERE source=? AND id=?",
+            (src, lid)).fetchone()
+        telegram_send(format_alert(row, score, predicted, shadow,
+                                   seen_row["first_seen_at"] if seen_row else None))
         time.sleep(1.0)
 
 
@@ -705,6 +772,7 @@ def poll_once(conn):
             rows = parse_listings(page_props, label)
             problems = verify_search_state(page_props, url, parsed_count=len(rows))
             new_rows = store_listings(conn, rows)  # comp data is comp data — always store
+            record_scan(conn, "autotrader", label, len(rows), len(new_rows))
             if problems:
                 log("[%s] search-state problems: %s" % (label, "; ".join(problems)))
                 warn_search_broken(conn, label, problems)
@@ -761,45 +829,114 @@ def maybe_refit(conn):
     log("refit: %d models written" % n)
 
 
-def send_shadow_digest(conn, manual=False):
-    since = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    rows = conn.execute(
-        """SELECT a.*, l.title, l.km, l.url FROM alerts a
-           LEFT JOIN listings l ON l.source = a.source AND l.id = a.listing_id
-           WHERE a.shadow = 1 AND a.fired_at >= ? ORDER BY a.z ASC""",
-        (since,),
-    ).fetchall()
-    lines = ["SHADOW DIGEST — %d would-have-fired alert(s) in the last 24h" % len(rows)]
-    for a in rows:
-        flags = ("[LOW CONF]" if a["low_confidence"] else "") + \
-                ("[DEALER]" if a["is_dealer"] else "")
-        lines.append("#%d z=%.1f %d%% below (pred $%s) %s — $%s %s\n%s" % (
-            a["alert_id"], a["z"], round(a["pct_below"]),
-            format(a["predicted_price"], ","), flags,
-            format(a["price"], ","), a["title"] or "", a["url"] or ""))
-    if not rows:
-        lines.append("(pipeline alive; nothing crossed the threshold)")
+def local_day_start_utc():
+    """UTC timestamp of 00:00 today in Edmonton — the digest's day boundary."""
+    midnight = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def send_telegram_chunks(lines, limit=3500):
     chunk = ""
     for line in lines:
-        if len(chunk) + len(line) > 3500:
-            telegram_send(chunk)
+        if chunk and len(chunk) + len(line) > limit:
+            telegram_send(chunk.rstrip())
             chunk = ""
-        chunk += line + "\n\n"
+        chunk += line + "\n"
     if chunk.strip():
         telegram_send(chunk.rstrip())
+
+
+def send_daily_digest(conn, manual=False):
+    """8 PM summary: scan volume, alerts, rejections, the day's best scores.
+
+    During shadow mode this is the only thing that reaches the phone, and it
+    goes out even on empty days — silence would be indistinguishable from a
+    dead pipeline."""
+    since = local_day_start_utc()
+    scans = conn.execute(
+        """SELECT source, search_label, SUM(parsed_count) AS parsed
+           FROM scans WHERE scanned_at >= ? GROUP BY source, search_label
+           ORDER BY source, search_label""", (since,)).fetchall()
+    by_source = {}
+    for s in scans:
+        by_source[s["source"]] = by_source.get(s["source"], 0) + (s["parsed"] or 0)
+
+    alerts = conn.execute(
+        "SELECT shadow, COUNT(*) AS n FROM alerts WHERE fired_at >= ? GROUP BY shadow",
+        (since,)).fetchall()
+    sent = sum(a["n"] for a in alerts if not a["shadow"])
+    shadowed = sum(a["n"] for a in alerts if a["shadow"])
+
+    rejects = conn.execute(
+        """SELECT reject_reason, COUNT(*) AS n FROM listings
+           WHERE first_seen_at >= ? AND reject_reason IS NOT NULL
+           GROUP BY reject_reason""", (since,)).fetchall()
+    by_reason = {}
+    for r in rejects:  # collapse 'blocklist:rebuilt' -> 'blocklist'
+        key = r["reject_reason"].split(":", 1)[0]
+        by_reason[key] = by_reason.get(key, 0) + r["n"]
+
+    best = conn.execute(
+        """SELECT l.*, EXISTS(SELECT 1 FROM alerts a WHERE a.source=l.source
+                              AND a.listing_id=l.id) AS alerted
+           FROM listings l WHERE l.scored_at >= ? AND l.z IS NOT NULL
+           ORDER BY l.z ASC LIMIT 5""", (since,)).fetchall()
+
+    lines = ["📊 DIGEST — %s" % datetime.now(TZ).strftime("%a %d %b")]
+    lines.append("Scanned: " + (" · ".join(
+        "%s %d" % (src, n) for src, n in sorted(by_source.items())) or "nothing"))
+    if scans:
+        # source-tagged: both sources use a 'cars_2k_15k' label, and an
+        # untagged breakdown makes a dead search look like a live one
+        tag = {"autotrader": "at", "facebook": "fb"}
+        lines.append("  " + " · ".join(
+            "%s:%s %d" % (tag.get(s["source"], s["source"]), s["search_label"],
+                          s["parsed"] or 0) for s in scans))
+    lines.append("Alerts: %d sent · %d shadow" % (sent, shadowed))
+    lines.append("Rejected %d: %s" % (
+        sum(by_reason.values()),
+        " · ".join("%s %d" % kv for kv in sorted(
+            by_reason.items(), key=lambda kv: -kv[1])) or "none"))
+    if best:
+        lines.append("")
+        lines.append("Best scores today:")
+        for i, b in enumerate(best, 1):
+            lines.append(" %d. z=%.1f · %d%% below · $%s · %s%s" % (
+                i, b["z"], round(b["pct_below"] or 0), format(b["price"], ","),
+                vehicle_line(dict(b)), "  ✅ alerted" if b["alerted"] else ""))
+
+    shadow_until = meta_get(conn, "shadow_until")
+    in_shadow = shadow_until and utc_now_iso() < shadow_until
+    if in_shadow:
+        would = conn.execute(
+            """SELECT a.*, l.url FROM alerts a
+               LEFT JOIN listings l ON l.source=a.source AND l.id=a.listing_id
+               WHERE a.shadow=1 AND a.fired_at >= ? ORDER BY a.z ASC""",
+            (since,)).fetchall()
+        lines.append("")
+        lines.append("🌒 SHADOW MODE until %s — nothing has buzzed your phone."
+                     % shadow_until[:10])
+        lines.append("Would have fired (%d):" % len(would))
+        for a in would:
+            marks = ("  ⚠️ low conf" if a["low_confidence"] else "") + \
+                    ("  🏪 dealer" if a["is_dealer"] else "")
+            lines.append("#%d z=%.1f · %d%% below · $%s vs $%s%s\n%s" % (
+                a["alert_id"], a["z"], round(a["pct_below"]),
+                format(a["price"], ","), format(a["predicted_price"], ","),
+                marks, a["url"] or ""))
+        if not would:
+            lines.append("(none crossed the threshold today)")
+    send_telegram_chunks(lines)
     if manual:
-        log("digest sent (%d shadow alerts)" % len(rows))
+        log("digest sent (%d sent, %d shadow alerts today)" % (sent, shadowed))
 
 
-def maybe_shadow_digest(conn):
+def maybe_daily_digest(conn):
     now_local = datetime.now(TZ)
     today = now_local.strftime("%Y-%m-%d")
     if now_local.hour < DIGEST_HOUR_LOCAL or meta_get(conn, "last_digest_date") == today:
         return
-    shadow_until = meta_get(conn, "shadow_until")
-    if not shadow_until or utc_now_iso() >= shadow_until:
-        return  # shadow mode over; Step 3's full daily digest takes it from here
-    send_shadow_digest(conn)
+    send_daily_digest(conn)
     meta_set(conn, "last_digest_date", today)
 
 
@@ -945,7 +1082,7 @@ def recheck_listings(conn):
 
 
 def run_scheduled_tasks(conn):
-    for task in (maybe_refit, maybe_shadow_digest, maybe_weekly_report,
+    for task in (maybe_refit, maybe_daily_digest, maybe_weekly_report,
                  recheck_listings):
         try:
             task(conn)
@@ -1013,6 +1150,11 @@ def handle_ingest_items(conn, items):
     """FB items go through the exact same store/assess/score/alert pipeline."""
     stored = skipped = 0
     now = utc_now_iso()
+    by_label = {}
+    for item in items:
+        if isinstance(item, dict):
+            lbl = str(item.get("label") or "facebook")[:40]
+            by_label[lbl] = by_label.get(lbl, 0) + 1
     for item in items:
         try:
             if not isinstance(item, dict):
@@ -1030,6 +1172,8 @@ def handle_ingest_items(conn, items):
         except Exception as e:
             skipped += 1
             log("ingest item failed: %s" % e.__class__.__name__)
+    for lbl, n in by_label.items():
+        record_scan(conn, "facebook", lbl, n, 0)
     return stored, skipped
 
 
@@ -1111,7 +1255,7 @@ def main():
     p.add_argument("--label", nargs=2, metavar=("ALERT_ID", "LABEL"),
                    help="label an alert: good|bad|scam|already_gone")
     p.add_argument("--digest", action="store_true",
-                   help="send the shadow digest now and exit")
+                   help="send the daily digest now and exit")
     p.add_argument("--report", action="store_true",
                    help="send the weekly report now and exit")
     args = p.parse_args()
@@ -1121,7 +1265,7 @@ def main():
         conn = init_db(DB_PATH)
         migrate_db(conn)
         if args.digest:
-            send_shadow_digest(conn, manual=True)
+            send_daily_digest(conn, manual=True)
         if args.report:
             send_weekly_report(conn)
         return

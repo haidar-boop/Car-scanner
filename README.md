@@ -11,8 +11,9 @@ underpriced cars around Edmonton. Precision over recall at every decision point.
   rotates through four Marketplace searches (cars ×2 price bands, trucks, SUVs)
   on a randomized 5–15 min reload and posts what it scrapes to the droplet.
 
-**Status: Step 2 of 5** (scoring engine live, in shadow mode). Alert formatting,
-failure hardening, and `--test` arrive in Steps 3–5.
+**Status: Step 3 of 5** (scoring engine live in shadow mode, phone-ready
+alerts and the daily digest). Failure hardening and `--test` arrive in
+Steps 4–5.
 
 **The asking-price caveat, stated plainly:** everything scraped is an **asking**
 price, not a transaction price. The model predicts what a car will be *listed*
@@ -46,12 +47,38 @@ correction: listings that vanish within ~48 h very likely sold fast.
    or age outside the fitted comps' range (no extrapolating depreciation
    curves), or a fit older than 30 days.
 
+## What lands on your phone
+
+An alert leads with the numbers that decide whether to drive across town,
+because the first line is all a notification preview shows:
+
+```
+⚡ 31% below · z=-2.9 · $22,741 · 2015 Ford F-150
+predicted $32,958 from 45 comps (FORD:F150)
+145,000 km · Private · Edmonton · seen 3m ago
+https://www.autotrader.ca/offers/...
+```
+
+Low-confidence and dealer alerts say so on their own line (`⚠️ LOW CONFIDENCE
+— segment model, too few comps for this family`, `🏪 DEALER — priced by a pro,
+check for a catch`). The URL is always last so it stays tappable.
+
+"seen 3m ago" is how long *we* have known about the listing, not its true
+posting age — neither site exposes when a listing was actually posted. It
+still answers the question that matters: whether you are first.
+
+At 8 PM Edmonton time a digest summarizes the day — listings scanned per
+source and per search, alerts fired, rejections by reason, and the five best
+scores (marking which ones alerted). It goes out even on empty days, since
+silence is indistinguishable from a dead pipeline. Telegram or network
+failures are logged and swallowed; nothing can take down the poll loop.
+
 ## Shadow mode and the feedback loop
 
 For the first **14 days** after scoring starts, nothing buzzes your phone:
-alerts are recorded silently and a digest of would-have-fired alerts goes out
-at 8 PM nightly (also a pipeline-alive heartbeat). Judge the precision, tune,
-then let it go live.
+alerts are recorded silently and the 8 PM digest gains a "would have fired"
+section listing each one with its z, discount and link. Judge the precision
+over a week of real days, tune, then let it go live.
 
 Label alerts from your phone (via SSH) after checking them:
 
@@ -61,7 +88,7 @@ python3 autotrader_watcher.py --label 12 good     # or bad | scam | already_gone
 
 Sunday 6 PM a weekly report lands in Telegram: alerts fired, labeled precision,
 and blocklist-term suggestions mined from bad/scam-labeled listings. Manual
-triggers: `--digest`, `--report`.
+triggers: `--digest`, `--report` (both send immediately and exit).
 
 ## Install (droplet)
 
@@ -107,7 +134,9 @@ a guessed comp is worse than no alert. FB listing lifespans are not tracked
 `reject_reason`, `z`, `pct_below`, `disappeared_at`), `price_history` (every
 observed price), `models` (cached fit coefficients + comp ranges + fitted_at),
 `alerts` (every real or shadow alert with the coefficients frozen at firing
-time, plus your labels), `meta` (seed flags, shadow_until, schedules).
+time, plus your labels), `scans` (one row per search fetched or ingest batch —
+scan volume the `listings` table can't show, since a cycle that re-sees 20
+known listings inserts nothing), `meta` (seed flags, shadow_until, schedules).
 
 Telegram credentials come from environment variables only
 (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`); with them unset the watcher runs
