@@ -91,16 +91,19 @@
   // --------------------------------------------------------------------------
 
   const ITEM_ID_RE = /\/marketplace\/item\/(\d+)/;
-  // Comma-grouped capture is load-bearing: textContent glues FB's price and
-  // title nodes with no separator ("CA$9,5002014 Ford..."), and a naive
-  // [\d,]+ would swallow the title's year into the price. But requiring a
-  // comma group ALWAYS meant an ungrouped run ("$15000", no thousands
-  // separator) matched only its first 1-3 digits — "$15000" became 150, a
-  // 100x-low price read as an extraordinary deal. The extra \d{4,}
-  // alternative (tried only once the comma-grouped form fails) captures the
-  // full ungrouped number in the common multi-line case, where price and
-  // title are already on separate lines and there's no year to swallow.
-  const PRICE_RE = /(?:CA\s?\$|C\$|\$)\s?(\d{1,3}(?:,\d{3})+|\d{4,}|\d{1,3})/;
+  // Two patterns, not one — an earlier version of this fix used a single
+  // permissive regex everywhere and reintroduced the exact bug the comment
+  // below warns about: when textContent glues price and title with no
+  // separator ("CA$9,5002014 Ford..."), a bare \d{4,} alternative has no
+  // delimiter to stop at and greedily swallows the year into the price,
+  // corrupting both. PRICE_LINE_RE is safe to use permissively because it
+  // only ever matches an ISOLATED line (FB already put the price on its own
+  // line; there is nothing else on that line to swallow) — it fixes the
+  // real bug, where an ungrouped price ("$15000", no thousands separator)
+  // matched only its first 1-3 digits and became a 100x-low price. The
+  // glued single-line fallback keeps the strict, comma-required pattern.
+  const PRICE_GLUED_RE = /(?:CA\s?\$|C\$|\$)\s?(\d{1,3}(?:,\d{3})*)/;
+  const PRICE_LINE_RE = /(?:CA\s?\$|C\$|\$)\s?(\d{1,3}(?:,\d{3})+|\d{4,}|\d{1,3})/;
 
   // The watcher only ever acts on its own configured searches. Any other
   // marketplace page — homepage, item pages, the user's own browsing tabs —
@@ -391,7 +394,19 @@
       }
       return;
     }
-    if (!entry.payload || !entry.payload.url) {
+    if (!entry.payload || !entry.payload.url || entry._qid == null) {
+      // Also catches an entry with no _qid: GM storage persists across
+      // script updates, so a queue entry pushed by a PRE-UPGRADE version
+      // (before _qid existed) is otherwise well-formed and sails through
+      // this check, but removeFromQueue can never identify and remove it —
+      // its `_qid == null` guard silently no-ops. Left alone, that entry
+      // gets re-dispatched (re-fetching the same URL) every cycle forever,
+      // burning the hourly budget on one stuck entry, and the budget-
+      // exceeded branch below recurses on it synchronously with no removal,
+      // which stack-overflows. Tagging it malformed here — same as a
+      // payload-less entry — makes the fix retroactive: any queue entry
+      // that predates _qid tagging is swept the first time it's touched.
+      //
       // A payload-less/urlless entry (foreign or corrupted GM storage —
       // maybeEnrich always sets a payload) has no reliable identity for
       // removeFromQueue to remove it BY: matching on payload.id can't work
@@ -400,7 +415,7 @@
       // also handles a queue with more than one, and guarantees the queue
       // strictly shrinks, so this can't recurse forever.
       const queue = GM_getValue("enrich_queue", [])
-        .filter((e) => e.payload && e.payload.url);
+        .filter((e) => e.payload && e.payload.url && e._qid != null);
       GM_setValue("enrich_queue", queue);
       if (entry.payload) shipBare(entry, "stale");
       return processEnrichQueue();
@@ -707,8 +722,9 @@
       const lines = raw.split("\n").map((s) => s.trim()).filter(Boolean);
       let price = null;
       const titleParts = [];
+      const priceRe = lines.length > 1 ? PRICE_LINE_RE : PRICE_GLUED_RE;
       for (const line of (lines.length > 1 ? lines : [raw])) {
-        const pm = line.match(PRICE_RE);
+        const pm = line.match(priceRe);
         if (pm && price === null) {
           price = pm[1];
           if (lines.length > 1) continue; // drop the price line from the title
@@ -717,7 +733,7 @@
       }
       let text = titleParts.join(" ");
       if (lines.length <= 1 && price !== null) {
-        text = raw.replace(PRICE_RE, " "); // glued fallback: excise the price
+        text = raw.replace(PRICE_GLUED_RE, " "); // glued fallback: excise the price
       }
       text = text.replace(/\s+/g, " ").trim();
       out.push({
