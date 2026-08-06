@@ -93,8 +93,14 @@
   const ITEM_ID_RE = /\/marketplace\/item\/(\d+)/;
   // Comma-grouped capture is load-bearing: textContent glues FB's price and
   // title nodes with no separator ("CA$9,5002014 Ford..."), and a naive
-  // [\d,]+ would swallow the title's year into the price.
-  const PRICE_RE = /(?:CA\s?\$|C\$|\$)\s?(\d{1,3}(?:,\d{3})*)/;
+  // [\d,]+ would swallow the title's year into the price. But requiring a
+  // comma group ALWAYS meant an ungrouped run ("$15000", no thousands
+  // separator) matched only its first 1-3 digits — "$15000" became 150, a
+  // 100x-low price read as an extraordinary deal. The extra \d{4,}
+  // alternative (tried only once the comma-grouped form fails) captures the
+  // full ungrouped number in the common multi-line case, where price and
+  // title are already on separate lines and there's no year to swallow.
+  const PRICE_RE = /(?:CA\s?\$|C\$|\$)\s?(\d{1,3}(?:,\d{3})+|\d{4,}|\d{1,3})/;
 
   // The watcher only ever acts on its own configured searches. Any other
   // marketplace page — homepage, item pages, the user's own browsing tabs —
@@ -317,7 +323,13 @@
       return;
     }
     enrichQueuedThisTick += 1;
-    queue.push({ payload: payload, tries: 0, queued_at: Date.now(),
+    // _qid is the entry's identity for removeFromQueue, independent of
+    // payload — matching by payload.id broke (infinite recursion, then a
+    // TypeError) the moment an entry's payload was missing, which is
+    // exactly the corrupt/foreign-storage case that path exists to handle.
+    const qid = GM_getValue("enrich_qid_counter", 0) + 1;
+    GM_setValue("enrich_qid_counter", qid);
+    queue.push({ _qid: qid, payload: payload, tries: 0, queued_at: Date.now(),
                  seed: !!payload.seed });
     GM_setValue("enrich_queue", queue);
     kickEnrichWorker();
@@ -336,8 +348,13 @@
   }
 
   function removeFromQueue(entry) {
+    // Matched by _qid, not payload.id: entry.payload can be missing (that's
+    // exactly the malformed-entry case callers use this for), and a stale
+    // GM re-read means entry is never the SAME object reference as anything
+    // in a fresh queue read, so identity has to survive both.
+    if (!entry || entry._qid == null) return;
     const queue = GM_getValue("enrich_queue", []);
-    const i = queue.findIndex((e) => e.payload && e.payload.id === entry.payload.id);
+    const i = queue.findIndex((e) => e._qid === entry._qid);
     if (i >= 0) queue.splice(i, 1);
     GM_setValue("enrich_queue", queue);
   }
@@ -375,7 +392,16 @@
       return;
     }
     if (!entry.payload || !entry.payload.url) {
-      removeFromQueue(entry);  // malformed queue entry: never fetch undefined
+      // A payload-less/urlless entry (foreign or corrupted GM storage —
+      // maybeEnrich always sets a payload) has no reliable identity for
+      // removeFromQueue to remove it BY: matching on payload.id can't work
+      // when payload is exactly what's missing. Strip every entry in this
+      // shape in one write instead of trying to remove "this one" — that
+      // also handles a queue with more than one, and guarantees the queue
+      // strictly shrinks, so this can't recurse forever.
+      const queue = GM_getValue("enrich_queue", [])
+        .filter((e) => e.payload && e.payload.url);
+      GM_setValue("enrich_queue", queue);
       if (entry.payload) shipBare(entry, "stale");
       return processEnrichQueue();
     }
@@ -519,15 +545,24 @@
       if (Date.now() - GM_getValue("last_ingest_at", 0) < INGEST_HEARTBEAT_MS) return;
     }
     const n = Math.min(buf.length, INGEST_BATCH_MAX);
+    const toSend = buf.slice(0, n);
+    const sentIds = new Set(toSend.map((it) => it.id));
     ingestInFlight = true;
     const done = (ok, why) => {
       ingestInFlight = false;
       if (ok) {
         GM_setValue("last_ingest_at", Date.now());
-        // splice against a re-read so items scraped mid-flight survive
+        // Filter by id, not position: re-reading the buffer and slicing off
+        // the first n assumed the re-read's front n items were exactly what
+        // was sent. They aren't when a cap-overflow eviction trimmed the
+        // front (bufferListing evicts oldest-first) or new items were
+        // appended during the in-flight POST — both shift positions, so the
+        // old code could silently drop listings that were never sent.
+        // Matching by id removes exactly what shipped, wherever it ended up.
         const cur = GM_getValue("ingest_buffer", []);
-        GM_setValue("ingest_buffer", cur.slice(n));
-        if (cur.length > n) flushIngest();
+        const remaining = cur.filter((it) => !sentIds.has(it.id));
+        GM_setValue("ingest_buffer", remaining);
+        if (remaining.length > 0) flushIngest();
       } else {
         console.warn("[car-watcher] ingest", why, "- buffered", buf.length);
       }
@@ -540,7 +575,7 @@
         "Content-Type": "application/json",
         "Authorization": "Bearer " + token,
       },
-      data: JSON.stringify(buf.slice(0, n)),
+      data: JSON.stringify(toSend),
       onload: (resp) => done(resp.status === 200, "HTTP " + resp.status),
       onerror: () => done(false, "network error"),
       ontimeout: () => done(false, "timeout"),

@@ -1554,19 +1554,33 @@ def check_scan_volume(conn):
     without ever returning a zero scan.
     """
     now = datetime.now(timezone.utc)
-    day_ago = (now - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    day_ago_dt = now - timedelta(hours=24)
+    day_ago = day_ago_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     week_ago = (now - timedelta(days=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
     rows = conn.execute(
         """SELECT source,
                   SUM(CASE WHEN scanned_at >= ? THEN parsed_count ELSE 0 END) AS today,
                   SUM(CASE WHEN scanned_at <  ? THEN parsed_count ELSE 0 END) AS prior,
-                  COUNT(DISTINCT CASE WHEN scanned_at < ? THEN date(scanned_at) END) AS days
+                  MIN(CASE WHEN scanned_at < ? THEN scanned_at END) AS prior_earliest
            FROM scans WHERE scanned_at >= ? GROUP BY source""",
         (day_ago, day_ago, day_ago, week_ago)).fetchall()
     for r in rows:
-        if (r["days"] or 0) < VOLUME_MIN_HISTORY_DAYS:
+        # History length as actual ELAPSED TIME of the prior window's data,
+        # not a count of distinct UTC calendar dates it touched — that
+        # count could run to 8 for a 7-day-wide window whenever the window
+        # falls mid-day (routine, since it's anchored to "now"), understating
+        # the average and needing a smaller drop than documented to trip.
+        if not r["prior_earliest"]:
+            continue
+        try:
+            earliest_dt = (datetime.strptime(r["prior_earliest"], "%Y-%m-%dT%H:%M:%SZ")
+                           .replace(tzinfo=timezone.utc))
+        except (ValueError, TypeError):
+            continue
+        span_days = (day_ago_dt - earliest_dt).total_seconds() / 86400.0
+        if span_days < VOLUME_MIN_HISTORY_DAYS:
             continue  # not enough history to call anything abnormal
-        avg = (r["prior"] or 0) / float(r["days"])
+        avg = (r["prior"] or 0) / min(span_days, 7.0)
         if avg <= 0:
             continue
         today = r["today"] or 0
