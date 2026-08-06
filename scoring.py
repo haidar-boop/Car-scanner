@@ -532,16 +532,37 @@ def known_vehicles(conn):
 
 
 def parse_fb_listing(item, known, now_iso):
-    """Ingest item {id,url,price_text,text,label,seen_at,seed} -> store row.
+    """Ingest item {id,url,price_text,text,label,seen_at,seed} -> store row,
+    plus optional enrichment fields fetched from the listing's own page:
+    {description, odo:{unit,value}, fb_title, enrich_status, enrich_keys,
+    enrich_err, enrich_extra}.
+
+    Enrichment rules, each precision-driven:
+    - description feeds the blocklist (via assess) and drivetrain — NEVER
+      trim (seller prose says "limited warranty") and NEVER identity or km
+      ("will trade for a Honda Civic", "timing belt done at 120,000 km").
+    - a structured odometer beats text-parsed km; MILES convert and flag.
+    - fb_title is the seller's real title and replaces the glued anchor
+      text for identity/trim — unless its year disagrees with the anchor
+      text's year, which smells like a wrong-vehicle payload (item pages
+      embed "more like this" data for OTHER listings): then trust the text.
 
     Fields that can't be parsed stay None; assess() downstream turns that
     into reject_reason='incomplete' (store-only, never scored, never a comp)
-    — expected for most FB anchors, and precision-preserving.
+    — expected for un-enriched FB anchors, and precision-preserving.
     """
     listing_id = str(item.get("id") or "").strip()
     if not listing_id or not listing_id.isdigit():
         return None
     text = str(item.get("text") or "")[:500]
+    description = str(item.get("description") or "")[:1500] or None
+    fb_title = str(item.get("fb_title") or "")[:300] or None
+    ident_text = text
+    if fb_title:
+        year_text = parse_year_from_text(text)
+        year_title = parse_year_from_text(fb_title)
+        if year_text is None or year_title is None or year_text == year_title:
+            ident_text = fb_title
     price = None
     digits = re.sub(r"[^\d]", "", str(item.get("price_text") or ""))
     if digits:
@@ -549,29 +570,76 @@ def parse_fb_listing(item, known, now_iso):
             price = int(digits[:9])
         except ValueError:
             price = None
-    km, miles = parse_km_text(text)
-    if km is not None and price is not None and abs(km - price) <= max(500, price * 0.02):
-        km, miles = None, None  # almost certainly the price echoed as mileage
-    make, after = _find_make_span(text, known["makes"])
+    km = miles = None
+    odo = item.get("odo")
+    if isinstance(odo, dict):
+        try:
+            val = int(float(odo.get("value")))
+        except (TypeError, ValueError):
+            val = None
+        if val and val > 0:
+            if str(odo.get("unit") or "").upper().startswith("MILE"):
+                km, miles = int(val * MILES_TO_KM), val
+            else:
+                km = val
+    if km is None:
+        # fb_title is the cleaner identity source but usually omits the km
+        # that the anchor text carries — fall back so enrichment can never
+        # make a listing LESS parseable than its bare form.
+        for source_text in ([ident_text, text] if ident_text is not text else [text]):
+            km, miles = parse_km_text(source_text)
+            if km is not None:
+                break
+        # The price-echo guard exists to catch text-regex misparses only; a
+        # structured odometer coincidentally equal to the price is legitimate.
+        if km is not None and price is not None \
+                and abs(km - price) <= max(500, price * 0.02):
+            km, miles = None, None
+    make, after = _find_make_span(ident_text, known["makes"])
+    if make is None and ident_text is not text:
+        make, after = _find_make_span(text, known["makes"])
     modelkey = find_model(after, known["models_by_make"].get(make)) if make else None
     # The listing's own model name must not be read as a trim ("Lexus LS").
     trim_tier, drivetrain = extract_features(
-        make, None, text, None,
+        make, None, ident_text, description,
         exclude_tokens=(modelkey,) if modelkey else ())
+    status = item.get("enrich_status")
+    if status not in ("ok", "partial", "failed", "skipped"):
+        status = None
+    raw = {
+        "text": text, "price_text": str(item.get("price_text") or "")[:40],
+        "seen_at": str(item.get("seen_at") or now_iso)[:32],
+    }
+    if status or item.get("enrich_err") or fb_title:
+        keys = item.get("enrich_keys")
+        extra = item.get("enrich_extra")
+        raw["enrich"] = {
+            "status": status,
+            "keys": [str(k)[:48] for k in (keys if isinstance(keys, list) else [])[:10]],
+            "err": (str(item.get("enrich_err"))[:48]
+                    if item.get("enrich_err") else None),
+            "extra": ({str(k)[:24]: str(v)[:48] for k, v in extra.items()}
+                      if isinstance(extra, dict) and extra else None),
+            "fb_title": fb_title,
+            "odo": odo if isinstance(odo, dict) else None,
+        }
     return {
         "id": listing_id,
         "source": "facebook",
         "url": "https://www.facebook.com/marketplace/item/%s" % listing_id,
-        "title": text[:200],
+        "title": ident_text[:200],
         "price": price,
-        "year": parse_year_from_text(text),
+        "year": parse_year_from_text(ident_text) or parse_year_from_text(text),
         "make": make,
         "model": modelkey,
         "km": km,
-        "seller_type": None,   # FB anchors carry no seller info
+        # vehicle_seller_type from enrichment stays in raw_json only: its
+        # vocabulary is unobserved, and a wrong mapping would move listings
+        # across the dealer alert threshold.
+        "seller_type": None,
         "city": None,
         "distance_km": None,
-        "description": None,
+        "description": description,
         "is_damaged": 0,
         "result_type": None,
         "price_label": None,
@@ -580,10 +648,8 @@ def parse_fb_listing(item, known, now_iso):
         "trim_tier": trim_tier,
         "drivetrain": drivetrain,
         "model_version": None,
-        "raw_json": json.dumps({
-            "text": text, "price_text": str(item.get("price_text") or "")[:40],
-            "seen_at": str(item.get("seen_at") or now_iso)[:32],
-        }),
+        "enrich_status": status,
+        "raw_json": json.dumps(raw),
     }
 
 
@@ -1000,6 +1066,75 @@ def _selftest():
          "text": "2012 Ford F-150 15k low kms great truck", "label": "trucks_5k_30k"},
         known, "2026-08-05T00:00:00Z")
     check("price-echo km dropped", row["km"] is None)
+
+    # --- enrichment fields ---
+    base_item = {"id": "123456782", "price_text": "CA$9,500",
+                 "text": "2014 Ford F-150 XLT", "label": "trucks_5k_30k"}
+    # blocklist via enriched description, end to end through assess()
+    row = parse_fb_listing(dict(base_item, description="was rebuilt after accident",
+                                enrich_status="partial"), known, "2026-08-05T00:00:00Z")
+    check("desc stored", row["description"] == "was rebuilt after accident")
+    check("desc blocklist e2e", (assess(dict(row, km=150_000), 2026)[2] or ""
+                                 ).startswith("blocklist"))
+    # structured odometer beats text, and MILES convert+flag
+    row = parse_fb_listing(dict(base_item, text="2014 Ford F-150 XLT 120,000 km",
+                                odo={"unit": "KILOMETERS", "value": 185000}),
+                           known, "2026-08-05T00:00:00Z")
+    check("odo beats text", row["km"] == 185_000)
+    row = parse_fb_listing(dict(base_item, odo={"unit": "MILES", "value": 120000}),
+                           known, "2026-08-05T00:00:00Z")
+    check("odo miles converted", row["km"] == 193_120
+          and row["km_converted_from_miles"] == 120_000)
+    # structured odo equal to price survives; text-parsed echo still dies
+    row = parse_fb_listing(dict(base_item, price_text="$15,000",
+                                odo={"unit": "KILOMETERS", "value": 15000}),
+                           known, "2026-08-05T00:00:00Z")
+    check("structured odo not echo-killed", row["km"] == 15_000)
+    # malformed odo degrades to the text path without raising
+    row = parse_fb_listing(dict(base_item, text="2014 Ford F-150 XLT 185,000 km",
+                                odo={"unit": "KILOMETERS", "value": "junk"}),
+                           known, "2026-08-05T00:00:00Z")
+    check("malformed odo degrades", row["km"] == 185_000)
+    # description is never a trim source ("limited warranty" prose)...
+    row = parse_fb_listing(dict(base_item, text="2015 Ford F-150 XL",
+                                description="limited warranty included"),
+                           known, "2026-08-05T00:00:00Z")
+    check("desc not trim source", row["trim_tier"] == 0)
+    # ...but IS a drivetrain source
+    row = parse_fb_listing(dict(base_item, text="2014 Ford F-150 XLT",
+                                description="quattro-style AWD, winter tires"),
+                           known, "2026-08-05T00:00:00Z")
+    check("desc drives drivetrain", row["drivetrain"] == "awd")
+    # description is never an identity source
+    row = parse_fb_listing({"id": "123456783", "price_text": "$8,000",
+                            "text": "2014 sedan low km",
+                            "description": "will trade for Ford F-150",
+                            "label": "cars_2k_15k"}, known, "2026-08-05T00:00:00Z")
+    check("desc not identity", row["make"] is None)
+    # fb_title replaces glued anchor text for identity...
+    row = parse_fb_listing(dict(base_item, text="2014 Ford F-150 XLTEdmonton, AB",
+                                fb_title="2014 Ford F-150 XLT 4x4"),
+                           known, "2026-08-05T00:00:00Z")
+    check("fb_title identity", row["drivetrain"] == "awd" and row["model"] == "F150")
+    # ...unless its year disagrees (wrong-vehicle payload defense)
+    row = parse_fb_listing(dict(base_item, text="2014 Ford F-150 XLT 185,000 km",
+                                fb_title="2018 Honda Civic Touring"),
+                           known, "2026-08-05T00:00:00Z")
+    check("fb_title year cross-check", row["make"] == "FORD" and row["year"] == 2014)
+    # fb_title without km must not lose the km the anchor text carried —
+    # enrichment can never make a listing LESS parseable than bare
+    row = parse_fb_listing(dict(base_item, text="2014 Ford F-150 XLT 185,000 km",
+                                fb_title="2014 Ford F-150 XLT"),
+                           known, "2026-08-05T00:00:00Z")
+    check("km falls back to text", row["km"] == 185_000 and row["model"] == "F150")
+    # bare item (pre-enrichment client) parses exactly as before
+    row = parse_fb_listing(
+        {"id": "123456789", "price_text": "CA$9,500",
+         "text": "2014 Ford F-150 XLT 185,000 km", "label": "trucks_5k_30k"},
+        known, "2026-08-05T00:00:00Z")
+    check("bare item regression", row["price"] == 9500 and row["year"] == 2014
+          and row["km"] == 185_000 and row["enrich_status"] is None
+          and row["description"] is None and "enrich" not in json.loads(row["raw_json"]))
 
     # trim / drivetrain extraction
     check("4x4 -> awd", parse_drivetrain("4x4 SV") == "awd")

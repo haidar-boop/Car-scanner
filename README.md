@@ -370,10 +370,61 @@ Traffic is plain HTTP; the bearer token is the only protection. The payload is
 public listing data, so the worst case of a sniffed token is fake listings —
 treat the token as disposable, or put an nginx/caddy TLS proxy in front later.
 
-Most FB anchor rows lack a parseable year or km — those are stored unscored
-(`reject_reason='incomplete'`) as future reference data. That is by design:
-a guessed comp is worse than no alert. FB listing lifespans are not tracked
-(the droplet can't fetch FB pages behind the login wall).
+FB anchor rows lacking a parseable year or km are stored unscored
+(`reject_reason='incomplete'`) as future reference data — a guessed comp is
+worse than no alert. FB listing lifespans are not tracked (the droplet can't
+fetch FB pages behind the login wall).
+
+### Item-page enrichment
+
+When the userscript spots a **new** listing, it quietly fetches that
+listing's own page *with your logged-in session* and extracts the
+description and odometer before shipping it to the droplet. That gives the
+blocklist eyes on "rebuilt title" for the scam-heaviest source, and turns
+most FB rows from `incomplete` into scoreable listings with real km.
+
+**This touches your real Facebook account.** The caps are deliberately
+conservative and the safety posture is back off, never push:
+
+| Cap | Value |
+|---|---|
+| New listings enriched per tick | 4 |
+| Gap between item-page fetches | 4–9 s jittered |
+| Fetches per rolling hour | 30 |
+| Fetch timeout | 8 s |
+| Seed (install-time) listings | idle-priority drip, 1 per 75 s, only while half the hourly budget is free |
+| On login/checkpoint/429 response | enrichment disabled 6 h + Telegram warning |
+
+A checkpoint warning on Telegram is an account-flag signal: **reduce the
+caps or set `ENRICH_ENABLED = false`**, don't raise them. Sold/deleted
+listings ("content isn't available") are expected in a hot market and never
+trigger the disable. With enrichment off or failing, every listing still
+ships bare within ~3 minutes worst case (normally 10–20 s) — enrichment can
+delay a listing, never lose one. `@connect www.facebook.com` in the header
+exists because GM_xmlhttpRequest requires host whitelisting even for the
+page's own domain.
+
+**The extraction keys are assumptions until your first real run.** The
+sandbox this was built in cannot see past FB's login wall, so the extractor
+table targets the community-known GraphQL keys (`redacted_description`,
+`vehicle_odometer_data`, `marketplace_listing_title`, …). Verify with one
+real look: open any listing, view page source, and search for
+`redacted_description` — if FB renamed it, update the regex table in
+`extractItemFields()`. The telemetry tells you without guessing:
+
+- daily digest line — `FB enrich (n=124): ok 78% · … — km 81% · desc 85%`;
+  a collapsing ok% means FB changed their JSON;
+- `--test` section 5b — per-key match counts and top error kinds from real
+  rows (`no_keys` dominating = key names wrong);
+- raw data: `SELECT json_extract(raw_json,'$.enrich') FROM listings WHERE
+  source='facebook' ORDER BY first_seen_at DESC LIMIT 20;`
+
+Description text feeds the blocklist and drivetrain detection only — never
+trim (seller prose says "limited warranty"), never identity ("will trade
+for a Honda Civic"), never km ("timing belt done at 120,000 km"; the
+structured odometer field carries the real reading). The enriched
+`vehicle_seller_type` is stored raw but not yet used for dealer detection —
+its value vocabulary is unknown until real pages are observed.
 
 ## Database
 

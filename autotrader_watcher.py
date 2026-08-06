@@ -88,7 +88,11 @@ VERIFY_WARN_COOLDOWN_S = 6 * 3600   # max one search-health warning per label pe
 # FB->droplet ingest bridge. Empty token = server disabled (never runs open).
 INGEST_TOKEN = os.environ.get("INGEST_TOKEN", "")
 INGEST_BIND = os.environ.get("INGEST_BIND", "0.0.0.0:8477")
-INGEST_MAX_BODY = 256 * 1024
+# 1 MB, not 256 KB: enriched items carry ~1.5 KB descriptions, and a batch
+# that exceeded this cap would 413 and be retried by the userscript forever
+# — a permanent silent ingest outage. The userscript batches at 60 items
+# (~150 KB worst case) so there is deliberate headroom on both sides.
+INGEST_MAX_BODY = 1024 * 1024
 INGEST_MAX_ITEMS = 200
 
 LOG_PATH = os.environ.get(
@@ -445,6 +449,10 @@ STEP6_MODEL_COLUMNS = {
 STEP6_ALERT_COLUMNS = {
     "adjustments": "TEXT",       # JSON snapshot of offsets applied at firing
 }
+# FB item-page enrichment. NULL = pre-enrichment row (no backfill possible).
+STEP7_LISTING_COLUMNS = {
+    "enrich_status": "TEXT",     # 'ok'|'partial'|'failed'|'skipped'|NULL
+}
 
 STEP2_DDL = """
 CREATE INDEX IF NOT EXISTS idx_listings_family ON listings(family);
@@ -511,7 +519,8 @@ def migrate_db(conn):
     conn.commit()
     for table, decls in (("listings", STEP6_LISTING_COLUMNS),
                          ("models", STEP6_MODEL_COLUMNS),
-                         ("alerts", STEP6_ALERT_COLUMNS)):
+                         ("alerts", STEP6_ALERT_COLUMNS),
+                         ("listings", STEP7_LISTING_COLUMNS)):
         have = {r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)}
         with conn:
             for name, decl in decls.items():
@@ -557,11 +566,20 @@ def migrate_db(conn):
                             mv = (raw.get("vehicle") or {}).get("modelVersionInput")
                             title = None  # synthesized "year make model": noise
                         else:
-                            # FB stores only text[:200] as title; the full
-                            # scraped text (what live extraction saw) is in
-                            # raw_json — a version bump must not degrade
-                            # rows whose tokens sit past char 200.
-                            title = raw.get("text") or r["title"]
+                            # Re-extract from what live extraction actually
+                            # saw: the enriched fb_title when one was
+                            # accepted (same year cross-check as
+                            # parse_fb_listing), else the full scraped text
+                            # from raw_json — never just the 200-char title
+                            # column. A version bump must not degrade rows.
+                            text = raw.get("text") or r["title"]
+                            fb_title = (raw.get("enrich") or {}).get("fb_title")
+                            title = text
+                            if fb_title:
+                                yt = scoring.parse_year_from_text(text or "")
+                                yf = scoring.parse_year_from_text(fb_title)
+                                if yt is None or yf is None or yt == yf:
+                                    title = fb_title
                     exclude = ()
                     if r["source"] == "facebook" and r["model"]:
                         exclude = (r["model"],)
@@ -593,7 +611,8 @@ def store_listings(conn, rows):
     with conn:
         for r in rows:
             cur = conn.execute(
-                "SELECT price FROM listings WHERE source=? AND id=?",
+                "SELECT price, description, km, enrich_status, trim_tier,"
+                " drivetrain FROM listings WHERE source=? AND id=?",
                 (r["source"], r["id"]),
             )
             existing = cur.fetchone()
@@ -605,15 +624,15 @@ def store_listings(conn, rows):
                         result_type, price_label, search_label,
                         first_seen_at, last_seen_at, raw_json,
                         km_converted_from_miles, trim_tier, drivetrain,
-                        model_version)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        model_version, enrich_status)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (r["id"], r["source"], r["url"], r["title"], r["price"],
                      r["year"], r["make"], r["model"], r["km"], r["seller_type"],
                      r["city"], r["distance_km"], r["description"], r["is_damaged"],
                      r["result_type"], r["price_label"], r["search_label"],
                      now, now, r["raw_json"], r.get("km_converted_from_miles"),
                      r.get("trim_tier"), r.get("drivetrain"),
-                     r.get("model_version")),
+                     r.get("model_version"), r.get("enrich_status")),
                 )
                 conn.execute(
                     "INSERT INTO price_history (source, id, price, seen_at)"
@@ -631,17 +650,33 @@ def store_listings(conn, rows):
                     # A changed price must pass the rejection layer again —
                     # an edit to $111 would otherwise sit in the comp pool as
                     # a clean row forever. The stale score is cleared too.
+                    # A bare FB repost (seen-ID eviction, storage reset) must
+                    # not launder away an enrichment-earned verdict: the
+                    # stored description/km/enrich_status survive when the
+                    # incoming row lacks them, and the re-assessment sees the
+                    # merged view — "rebuilt title" stays rejected.
+                    merged = dict(r)
+                    for col in ("description", "km", "trim_tier", "drivetrain"):
+                        if merged.get(col) is None:
+                            merged[col] = existing[col]
+                    keep_status = existing["enrich_status"]
+                    if merged.get("enrich_status") in ("ok", "partial") \
+                            or keep_status not in ("ok", "partial"):
+                        keep_status = merged.get("enrich_status")
                     family, fp, reason = scoring.assess(
-                        r, datetime.now(timezone.utc).year)
+                        merged, datetime.now(timezone.utc).year)
                     conn.execute(
                         "UPDATE listings SET last_seen_at=?, price=?, raw_json=?,"
                         " family=?, fingerprint=?, reject_reason=?,"
                         " trim_tier=?, drivetrain=?, model_version=?,"
+                        " description=?, km=?, enrich_status=?,"
                         " z=NULL, pct_below=NULL, scored_at=NULL"
                         " WHERE source=? AND id=?",
                         (now, r["price"], r["raw_json"], family, fp, reason,
-                         r.get("trim_tier"), r.get("drivetrain"),
-                         r.get("model_version"), r["source"], r["id"]),
+                         merged.get("trim_tier"), merged.get("drivetrain"),
+                         merged.get("model_version"), merged.get("description"),
+                         merged.get("km"), keep_status,
+                         r["source"], r["id"]),
                     )
                 else:
                     conn.execute(
@@ -1231,6 +1266,25 @@ def send_daily_digest(conn, manual=False):
         sum(by_reason.values()),
         " · ".join("%s %d" % kv for kv in sorted(
             by_reason.items(), key=lambda kv: -kv[1])) or "none"))
+
+    fb = conn.execute(
+        """SELECT COUNT(*) AS n,
+                  SUM(enrich_status='ok') AS ok,
+                  SUM(enrich_status='partial') AS part,
+                  SUM(enrich_status='failed') AS fail,
+                  SUM(enrich_status='skipped') AS skip,
+                  SUM(km IS NOT NULL) AS has_km,
+                  SUM(description IS NOT NULL) AS has_desc
+           FROM listings WHERE source='facebook' AND first_seen_at >= ?""",
+        (since,)).fetchone()
+    if fb["n"]:
+        # A collapsing ok%% here is the "FB changed their item-page JSON"
+        # alarm — the extractor keys need updating.
+        pct = lambda x: round(100 * (x or 0) / fb["n"])
+        lines.append("FB enrich (n=%d): ok %d%% · partial %d%% · failed %d%% ·"
+                     " skipped %d%% — km %d%% · desc %d%%" % (
+                         fb["n"], pct(fb["ok"]), pct(fb["part"]), pct(fb["fail"]),
+                         pct(fb["skip"]), pct(fb["has_km"]), pct(fb["has_desc"])))
     if best:
         lines.append("")
         lines.append("Best scores today:")
@@ -1868,6 +1922,46 @@ def run_test():
         readiness = comp_readiness(conn)
         for line in readiness:
             print("  " + line)
+
+        fb_week = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fb = conn.execute(
+            """SELECT COUNT(*) AS n,
+                      SUM(enrich_status='ok') AS ok,
+                      SUM(enrich_status='partial') AS part,
+                      SUM(enrich_status='failed') AS fail,
+                      SUM(enrich_status='skipped') AS skip,
+                      SUM(km IS NOT NULL) AS has_km,
+                      SUM(description IS NOT NULL) AS has_desc
+               FROM listings WHERE source='facebook' AND first_seen_at >= ?""",
+            (fb_week,)).fetchone()
+        if fb["n"]:
+            print("\n--- 5b. FB ENRICHMENT (7d) ---------------------------------------")
+            print("  %d rows: ok %s · partial %s · failed %s · skipped %s"
+                  " · km %s · desc %s" % (
+                      fb["n"], fb["ok"] or 0, fb["part"] or 0, fb["fail"] or 0,
+                      fb["skip"] or 0, fb["has_km"] or 0, fb["has_desc"] or 0))
+            # The blind-tuning readout: which extractor keys are matching on
+            # real pages, and what the failures say. no_keys dominating =
+            # FB renamed things; fix the extractor table in the userscript.
+            from collections import Counter
+            key_counts, err_counts = Counter(), Counter()
+            for (rj,) in conn.execute(
+                """SELECT raw_json FROM listings WHERE source='facebook'
+                   AND first_seen_at >= ? ORDER BY first_seen_at DESC LIMIT 200""",
+                    (fb_week,)):
+                try:
+                    enrich = (json.loads(rj) or {}).get("enrich") or {}
+                except (ValueError, TypeError):
+                    continue
+                key_counts.update(enrich.get("keys") or [])
+                if enrich.get("err"):
+                    err_counts[enrich["err"]] += 1
+            if key_counts:
+                print("  keys matched: " + " · ".join(
+                    "%s %d" % kv for kv in key_counts.most_common(8)))
+            if err_counts:
+                print("  errors: " + " · ".join(
+                    "%s %d" % kv for kv in err_counts.most_common(6)))
 
         print("\n--- 6. TELEGRAM --------------------------------------------------")
         suppressed = list(_SUPPRESSED_SENDS)

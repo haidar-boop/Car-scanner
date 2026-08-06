@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FB Marketplace Car Watcher (Edmonton)
 // @namespace    car-scanner
-// @version      0.3.0
+// @version      0.4.0
 // @description  Rotates a pinned tab through Edmonton car/truck/SUV searches, posts scraped listings to the droplet scorer
 // @match        https://www.facebook.com/marketplace/*
 // @grant        GM_setValue
@@ -9,10 +9,15 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_xmlhttpRequest
 // @connect      api.telegram.org
+// @connect      www.facebook.com
 // @connect      YOUR_DROPLET_HOST
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
+// @connect www.facebook.com is required even though the page IS facebook:
+// GM_xmlhttpRequest runs in the extension background context and every
+// target host must be whitelisted. Cookies ride along by default, which is
+// what lets item-page enrichment fetches see the logged-in page.
 
 (function () {
   "use strict";
@@ -48,9 +53,34 @@
   const INGEST_URL = "http://YOUR_DROPLET_HOST:8477/ingest";
   const INGEST_FLUSH_MS = 60 * 1000;
   const INGEST_BUFFER_CAP = 500;         // oldest dropped past this
-  const INGEST_BATCH_MAX = 200;          // server-side items-per-request cap
+  // 60, not the server's 200-item cap: enriched items run ~2-3 KB each, and
+  // a batch must stay far below the droplet's 1 MB body limit — an oversized
+  // batch would 413 and be retried forever, a permanent silent outage.
+  const INGEST_BATCH_MAX = 60;
   const INGEST_TIMEOUT_MS = 20 * 1000;
   const INGEST_HEARTBEAT_MS = 15 * 60 * 1000;  // empty post so silence == dead tab
+
+  // --- item-page enrichment -------------------------------------------------
+  // After spotting a NEW listing, fetch its item page with the logged-in
+  // session and extract description/odometer, so the droplet's blocklist can
+  // see "rebuilt title" and the listing becomes scoreable. This touches the
+  // user's real FB account: every cap below is deliberately conservative,
+  // and a checkpoint/login response disables the feature for hours.
+  const ENRICH_ENABLED = true;           // kill switch: false = exact v0.3 behavior
+  const ENRICH_TIMEOUT_MS = 8000;
+  const ENRICH_PER_TICK_MAX = 4;         // new listings queued per tick
+  const ENRICH_GAP_MIN_MS = 4000;        // jittered spacing between fetches
+  const ENRICH_GAP_MAX_MS = 9000;
+  const ENRICH_HOURLY_CAP = 30;          // dispatched fetches per rolling hour
+  const ENRICH_QUEUE_CAP = 50;           // overflow ships bare immediately
+  const ENRICH_QUEUE_MAX_AGE_MS = 3 * 60 * 1000;  // startup sweep bound
+  const ENRICH_DISABLE_MS = 6 * 3600 * 1000;      // after a block/login wall
+  const ENRICH_DESC_CAP = 1500;
+  // Seed listings (install-time inventory) are the initial FB comp pool, so
+  // they are worth enriching — but only as an idle drip, never a burst: the
+  // burst is the bot-like signature, not the fetches themselves.
+  const ENRICH_SEED = true;
+  const ENRICH_SEED_GAP_MS = 75 * 1000;
   // FB lazy-renders, so the first ticks legitimately see nothing. Five
   // consecutive empty ticks (~100s) on a sorted search page means the
   // anchors moved — i.e. the scraper is blind, which otherwise looks
@@ -147,6 +177,281 @@
       },
       onerror: (e) => console.warn("[car-watcher] telegram send failed", e),
     });
+  }
+
+  // --- item-page enrichment -------------------------------------------------
+  // EVERY JSON key below is an ASSUMPTION from community knowledge of FB's
+  // GraphQL payloads — the droplet sandbox cannot see past the login wall.
+  // Each shipped item carries enrich_keys telemetry naming exactly which
+  // extractors matched, so after one real look at a live item page
+  // (view-source, search "redacted_description") the key names can be fixed
+  // here without guessing. "failed/no_keys" dominating the telemetry is the
+  // signature of FB having renamed things.
+
+  function jsonStrRe(key, between) {
+    // Captures a JSON string literal INCLUDING quotes; JSON.parse of the
+    // capture then decodes \uXXXX, \", \n correctly.
+    return new RegExp('"' + key + '"\\s*:\\s*' + (between || "") +
+                      '("(?:[^"\\\\]|\\\\.)*")');
+  }
+
+  function extractItemFields(html) {
+    const fields = {};
+    const keys = [];
+    const grab = (name, re, apply) => {
+      try {
+        const m = html.match(re);
+        if (!m) return;
+        apply(m);
+        keys.push(name);
+      } catch (e) {
+        keys.push(name + "!parse");
+      }
+    };
+    grab("redacted_description",
+         /"redacted_description"\s*:\s*\{[^{}]*?"text"\s*:\s*("(?:[^"\\]|\\.)*")/,
+         (m) => { fields.description = JSON.parse(m[1]).slice(0, ENRICH_DESC_CAP); });
+    grab("vehicle_odometer_data",
+         /"vehicle_odometer_data"\s*:\s*(\{[^{}]*\})/,
+         (m) => {
+           const o = JSON.parse(m[1]);
+           if (o && o.value !== undefined) {
+             fields.odo = { unit: String(o.unit || ""), value: o.value };
+           } else { throw new Error("shape"); }
+         });
+    grab("marketplace_listing_title", jsonStrRe("marketplace_listing_title"),
+         (m) => { fields.fb_title = JSON.parse(m[1]).slice(0, 300); });
+    grab("listing_price",
+         /"listing_price"\s*:\s*\{[^{}]*?"(?:amount|formatted_amount)"\s*:\s*"?([\d.,]+)"?/,
+         (m) => { fields.price_text_item = m[1]; });
+    const extra = {};
+    grab("vehicle_transmission_type", jsonStrRe("vehicle_transmission_type"),
+         (m) => { extra.transmission = JSON.parse(m[1]).slice(0, 40); });
+    grab("vehicle_seller_type", jsonStrRe("vehicle_seller_type"),
+         (m) => { extra.seller_type = JSON.parse(m[1]).slice(0, 40); });
+    grab("vehicle_is_paid_off", /"vehicle_is_paid_off"\s*:\s*(true|false)/,
+         (m) => { extra.paid_off = m[1] === "true"; });
+    if (Object.keys(extra).length) fields.enrich_extra = extra;
+    return { fields: fields, keys: keys.slice(0, 10) };
+  }
+
+  function isUnavailablePage(status, html) {
+    // A sold/deleted listing, NOT a block — these vanish within minutes in a
+    // hot market and must never trip the 6h disable.
+    if (status === 404) return true;
+    return /content isn'?t available|isn'?t available right now/i.test(html || "");
+  }
+
+  function detectBlocked(status, finalUrl, html) {
+    if (status === 429) return "rate-limit";
+    if (status === 401 || status === 403) return "blocked";
+    const u = String(finalUrl || "");
+    if (/\/(login|checkpoint|recover)\b/.test(u)) {
+      return u.includes("checkpoint") ? "checkpoint" : "login";
+    }
+    const h = (html || "").slice(0, 50000);
+    if (/name="pass"/.test(h) && (/name="email"/.test(h) || /login_form/.test(h))) {
+      return "login";
+    }
+    // Deliberately NO bare "security check" text match: page prose (a
+    // description saying a car "passed the security check") must never buy
+    // a 6h disable. The URL and form-action markers carry the detection; a
+    // missed soft-block only shows up as failed extractions, which is safe.
+    if (/action="[^"]*\/checkpoint\//.test(h)) {
+      return "checkpoint";
+    }
+    return null;
+  }
+
+  let enrichBusy = false;
+  let enrichTimer = null;
+  let enrichQueuedThisTick = 0;   // reset in tick()
+
+  function enrichHourBudgetLeft() {
+    const hour = Math.floor(Date.now() / 3600000);
+    const bucket = GM_getValue("enrich_hour_bucket", { hour: 0, n: 0 });
+    return ENRICH_HOURLY_CAP - (bucket.hour === hour ? bucket.n : 0);
+  }
+
+  function enrichCountDispatch() {
+    const hour = Math.floor(Date.now() / 3600000);
+    const bucket = GM_getValue("enrich_hour_bucket", { hour: 0, n: 0 });
+    GM_setValue("enrich_hour_bucket",
+                bucket.hour === hour ? { hour: hour, n: bucket.n + 1 }
+                                     : { hour: hour, n: 1 });
+  }
+
+  function maybeEnrich(payload) {
+    if (!ENRICH_ENABLED) {
+      bufferListing(payload);  // wire format byte-identical to v0.3
+      return;
+    }
+    const queue = GM_getValue("enrich_queue", []);
+    const disabled = GM_getValue("enrich_disabled_until", 0) > Date.now();
+    if (disabled || enrichHourBudgetLeft() <= 0
+        || enrichQueuedThisTick >= ENRICH_PER_TICK_MAX
+        || queue.length >= ENRICH_QUEUE_CAP) {
+      bufferListing(Object.assign({}, payload, {
+        enrich_status: "skipped",
+        enrich_err: disabled ? "disabled" : "capped",
+      }));
+      return;
+    }
+    enrichQueuedThisTick += 1;
+    queue.push({ payload: payload, tries: 0, queued_at: Date.now(),
+                 seed: !!payload.seed });
+    GM_setValue("enrich_queue", queue);
+    kickEnrichWorker();
+  }
+
+  function kickEnrichWorker() {
+    if (enrichBusy || enrichTimer) return;
+    processEnrichQueue();
+  }
+
+  function shipBare(entry, err) {
+    bufferListing(Object.assign({}, entry.payload, {
+      enrich_status: err === "skipped" ? "skipped" : "failed",
+      enrich_err: err,
+    }));
+  }
+
+  function removeFromQueue(entry) {
+    const queue = GM_getValue("enrich_queue", []);
+    const i = queue.findIndex((e) => e.payload && e.payload.id === entry.payload.id);
+    if (i >= 0) queue.splice(i, 1);
+    GM_setValue("enrich_queue", queue);
+  }
+
+  function processEnrichQueue() {
+    const queue = GM_getValue("enrich_queue", []);
+    if (queue.length === 0) return;
+    if (GM_getValue("enrich_disabled_until", 0) > Date.now()) {
+      // Listings must never wait out the disable window to reach the droplet.
+      for (const e of queue) shipBare(e, "disabled");
+      GM_setValue("enrich_queue", []);
+      return;
+    }
+    let entry = queue.find((e) => !e.seed);
+    if (!entry && ENRICH_SEED) {
+      // Seed comps drip only when idle: one per gap, and only while the
+      // hourly counter keeps half its headroom for fresh listings.
+      const okPace = Date.now() - GM_getValue("enrich_seed_last_at", 0)
+                     >= ENRICH_SEED_GAP_MS;
+      if (okPace && enrichHourBudgetLeft() > ENRICH_HOURLY_CAP / 2) {
+        entry = queue.find((e) => e.seed);
+        if (entry) GM_setValue("enrich_seed_last_at", Date.now());
+      }
+    }
+    if (!entry) {
+      // Only seed entries and not their turn yet. The chain must re-arm
+      // itself: fetch completions are the usual driver, and a queue of
+      // pure seeds would otherwise stall until the next new listing or
+      // rotation reload — killing the drip on quiet searches.
+      if (queue.some((e) => e.seed) && !enrichTimer) {
+        enrichTimer = true;
+        setTimeout(() => { enrichTimer = null; processEnrichQueue(); },
+                   ENRICH_SEED_GAP_MS + 1000);
+      }
+      return;
+    }
+    if (!entry.payload || !entry.payload.url) {
+      removeFromQueue(entry);  // malformed queue entry: never fetch undefined
+      if (entry.payload) shipBare(entry, "stale");
+      return processEnrichQueue();
+    }
+    if (enrichHourBudgetLeft() <= 0) {
+      if (!entry.seed) {
+        removeFromQueue(entry);
+        shipBare(entry, "skipped");
+        return processEnrichQueue();  // next entry may be a waitable seed
+      }
+      if (!enrichTimer) {  // seeds wait for the hour to roll — re-arm
+        enrichTimer = true;
+        setTimeout(() => { enrichTimer = null; processEnrichQueue(); },
+                   ENRICH_SEED_GAP_MS + 1000);
+      }
+      return;
+    }
+    // tries increments and persists BEFORE dispatch: if the rotation reload
+    // kills the in-flight fetch, the startup sweep sees tries>=1 and ships
+    // the listing bare — an enrichment can delay a listing, never lose it.
+    entry.tries += 1;
+    GM_setValue("enrich_queue", queue);
+    enrichCountDispatch();
+    enrichBusy = true;
+    GM_xmlhttpRequest({
+      method: "GET",
+      url: entry.payload.url,
+      timeout: ENRICH_TIMEOUT_MS,
+      onload: (resp) => finishEnrich(entry, resp),
+      onerror: () => finishEnrich(entry, null, "network"),
+      ontimeout: () => finishEnrich(entry, null, "timeout"),
+    });
+  }
+
+  function finishEnrich(entry, resp, errKind) {
+    removeFromQueue(entry);
+    if (!resp) {
+      shipBare(entry, errKind || "network");
+    } else if (isUnavailablePage(resp.status, resp.responseText)) {
+      shipBare(entry, "unavailable");  // sold/deleted — expected, not a block
+    } else {
+      const blocked = detectBlocked(resp.status, resp.finalUrl, resp.responseText);
+      if (blocked) {
+        GM_setValue("enrich_disabled_until", Date.now() + ENRICH_DISABLE_MS);
+        const lastWarn = GM_getValue("enrich_block_warned_at", 0);
+        if (Date.now() - lastWarn > WARN_COOLDOWN_MS) {
+          GM_setValue("enrich_block_warned_at", Date.now());
+          telegramSend("WARNING [facebook] item-page fetch hit a " + blocked +
+                       " wall — enrichment disabled 6h. This can be an " +
+                       "account-flag signal; ease off if it repeats.");
+        }
+        console.warn("[car-watcher] enrichment blocked:", blocked);
+        shipBare(entry, "blocked:" + blocked);
+        const rest = GM_getValue("enrich_queue", []);
+        for (const e of rest) shipBare(e, "disabled");
+        GM_setValue("enrich_queue", []);
+      } else if (resp.status !== 200) {
+        shipBare(entry, "http_" + resp.status);
+      } else {
+        const out = extractItemFields(resp.responseText || "");
+        const enriched = Object.assign({}, entry.payload, out.fields, {
+          enrich_keys: out.keys,
+          enrich_status: (out.fields.description && out.fields.odo) ? "ok"
+            : (out.keys.length ? "partial" : "failed"),
+        });
+        if (!out.keys.length) enriched.enrich_err = "no_keys";
+        bufferListing(enriched);
+      }
+    }
+    enrichBusy = false;
+    const delay = ENRICH_GAP_MIN_MS
+      + Math.random() * (ENRICH_GAP_MAX_MS - ENRICH_GAP_MIN_MS);
+    // Flag set BEFORE scheduling (we never cancel, so no id needed): the
+    // assign-after-setTimeout pattern leaves a stale truthy id if a timer
+    // ever fires synchronously, wedging the worker.
+    enrichTimer = true;
+    setTimeout(() => {
+      enrichTimer = null;
+      processEnrichQueue();
+    }, delay);
+  }
+
+  function sweepEnrichQueue() {
+    // Startup recovery: anything a previous page-life dispatched (tries>=1)
+    // or left waiting too long ships bare now — hard latency bound ~3 min.
+    const queue = GM_getValue("enrich_queue", []);
+    if (queue.length === 0) return;
+    const keep = [];
+    for (const e of queue) {
+      if (e.tries >= 1) shipBare(e, "reload");
+      else if (Date.now() - (e.queued_at || 0) > ENRICH_QUEUE_MAX_AGE_MS) {
+        shipBare(e, "stale");
+      } else keep.push(e);
+    }
+    GM_setValue("enrich_queue", keep);
+    if (keep.length) kickEnrichWorker();
   }
 
   // --- droplet ingest bridge ------------------------------------------------
@@ -373,14 +678,16 @@
     const seeding = !seeded[search.label];
     let dirty = false;
 
+    enrichQueuedThisTick = 0;
     for (const l of listings) {
       if (seenSet.has(l.id)) continue;
       seenSet.add(l.id);
       seenArr.push(l.id);
       dirty = true;
       // The droplet decides what's alert-worthy; seed-pass items are flagged
-      // so it stores them as comp data without ever alerting.
-      bufferListing({
+      // so it stores them as comp data without ever alerting. New listings
+      // detour through item-page enrichment (bounded seconds, never lost).
+      maybeEnrich({
         id: l.id, url: l.url, price_text: l.price, text: l.text,
         label: search.label, seen_at: new Date().toISOString(), seed: seeding,
       });
@@ -433,6 +740,7 @@
     }
     GM_setValue("rot_expect", "");
     console.log("[car-watcher] active on", search.label);
+    sweepEnrichQueue();
     tick();
     setInterval(tick, SCRAPE_INTERVAL_MS);
     setInterval(flushIngest, INGEST_FLUSH_MS);
