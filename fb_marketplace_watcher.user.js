@@ -243,14 +243,35 @@
          (m) => { extra.paid_off = m[1] === "true"; });
     // Photo URLs for the droplet's AI verification gate. Like every key in
     // this table, "listing_photos" is an ASSUMPTION until the first real
-    // run — the telemetry (enrich_keys) says whether it matched. Scoped to
-    // a bounded window after the key so profile pictures and "more like
-    // this" images elsewhere in the page can't leak in. The URIs are
-    // signed and expire in hours; that's fine, the AI check runs minutes
-    // after discovery.
+    // run — the telemetry (enrich_keys) says whether it matched. The scan
+    // is bounded at the ARRAY'S OWN closing bracket, not a fixed-size
+    // window: a listing with fewer than 5 photos would otherwise keep
+    // matching image nodes past the array — the seller's profile picture
+    // and "more like this" photos of OTHER vehicles — and hand the AI gate
+    // a manufactured vehicle-mismatch on exactly the sparse listings that
+    // leave slots free. The depth scan honors string literals so brackets
+    // inside URLs can't derail it. URIs are signed and expire in hours;
+    // fine — the AI check runs minutes after discovery.
     grab("listing_photos", /"listing_photos"\s*:\s*\[/,
          (m) => {
-           const win = html.slice(m.index, m.index + 40000);
+           const start = m.index + m[0].length - 1;  // at the '['
+           const lim = Math.min(html.length, start + 200000);
+           let depth = 0, inStr = false, esc = false, end = -1;
+           for (let i = start; i < lim; i++) {
+             const ch = html[i];
+             if (inStr) {
+               if (esc) esc = false;
+               else if (ch === "\\") esc = true;
+               else if (ch === '"') inStr = false;
+             } else if (ch === '"') inStr = true;
+             else if (ch === "[" || ch === "{") depth++;
+             else if (ch === "]" || ch === "}") {
+               depth--;
+               if (depth === 0) { end = i; break; }
+             }
+           }
+           if (end < 0) throw new Error("shape");
+           const win = html.slice(start, end + 1);
            const re = /"image"\s*:\s*\{[^{}]*?"uri"\s*:\s*("(?:[^"\\]|\\.)*")/g;
            const urls = [];
            let mm;

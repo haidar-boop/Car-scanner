@@ -68,10 +68,17 @@ SEARCH_URLS = [
 POLL_INTERVAL_BASE_S = 300          # 5 min base ...
 POLL_JITTER_S = 240                 # ... + uniform(0, 240) -> 5-9 min per cycle
 BETWEEN_SEARCHES_S = (2.0, 5.0)     # random pause between the 3 fetches
-# maybe_alert()'s own send can be in flight (up to the 15s HTTP timeout) when
-# notified_at is still NULL — retry_failed_alerts() must not race it. A row
-# only becomes retry-eligible once it's older than this, well past worst case.
-ALERT_RETRY_GRACE_S = 60
+# maybe_alert()'s send path can be in flight with notified_at still NULL —
+# retry_failed_alerts() must not race it, or it delivers an alert the AI
+# gate is about to reject (silent gate bypass), sends a caution without its
+# note, or double-sends. The in-flight window is NOT just telegram's 15s:
+# the AI call adds AI_TIMEOUT_S (nominally 60s, and httpx applies a bare
+# float PER PHASE, so wall clock can run longer) plus the 30s text-only
+# fallback retry plus the 1s spacing — ~106s+ worst case. 300s keeps ~3x
+# margin over that, and costs at most one extra sweep cycle (5-9 min)
+# before a genuinely-failed send retries. If AI_TIMEOUT_S grows, this must
+# grow with it.
+ALERT_RETRY_GRACE_S = 300
 ALERT_RETRY_SPACING_S = 1.0         # match maybe_alert's ~1 msg/s pacing
 FETCH_TIMEOUT_S = 25
 FETCH_RETRIES = 3
@@ -99,6 +106,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 AI_VERIFY_ENABLED = os.environ.get("AI_VERIFY_ENABLED", "1") != "0"
 AI_MODEL = "claude-opus-5"
 AI_TIMEOUT_S = 60.0                 # bounded delay; on timeout the alert sends unchanged
+AI_FALLBACK_TIMEOUT_S = 30.0        # text-only retry when the photo call fails
 AI_MAX_TOKENS = 4000                # covers adaptive thinking + the small verdict JSON
 AI_MAX_PHOTOS = 5
 
@@ -1192,22 +1200,40 @@ def ai_verify(row, score, predicted):
             "title": (row.get("title") or "(none)")[:300],
             "description": (row.get("description") or "(no description)")[:2000],
         }})
-        client = anthropic.Anthropic(
-            api_key=ANTHROPIC_API_KEY, timeout=AI_TIMEOUT_S, max_retries=0)
-        resp = client.messages.create(
-            model=AI_MODEL,
-            max_tokens=AI_MAX_TOKENS,
-            thinking={"type": "adaptive"},
-            system=AI_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": content}],
-            output_config={"format": {"type": "json_schema", "schema": AI_SCHEMA}},
-        )
-        text = next(b.text for b in resp.content if b.type == "text")
-        out = json.loads(text)
-        if out.get("verdict") not in ("clear", "caution", "reject"):
-            return None
-        out["summary"] = str(out.get("summary") or "")[:160]
-        return out
+        def _call(blocks, timeout_s):
+            client = anthropic.Anthropic(
+                api_key=ANTHROPIC_API_KEY, timeout=timeout_s, max_retries=0)
+            resp = client.messages.create(
+                model=AI_MODEL,
+                max_tokens=AI_MAX_TOKENS,
+                thinking={"type": "adaptive"},
+                system=AI_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": blocks}],
+                output_config={"format": {"type": "json_schema",
+                                          "schema": AI_SCHEMA}},
+            )
+            text = next(b.text for b in resp.content if b.type == "text")
+            out = json.loads(text)
+            if out.get("verdict") not in ("clear", "caution", "reject"):
+                return None
+            out["summary"] = str(out.get("summary") or "")[:160]
+            return out
+
+        try:
+            return _call(content, AI_TIMEOUT_S)
+        except Exception as e:
+            if not photos:
+                raise
+            # One dead image URL fails the WHOLE call server-side, and the
+            # re-score (price-cut) path fires on aged listings whose photos
+            # are exactly the ones that expire: FB URLs are signed for hours,
+            # and AutoTrader purges sold listings' images. A text-only retry
+            # keeps the AI gate covering the description on precisely the
+            # alerts most likely to carry dead photos, instead of silently
+            # skipping the check. Still bounded and still fail-open.
+            log("ai verify photo call failed (%s) — retrying text-only"
+                % e.__class__.__name__)
+            return _call(content[-1:], AI_FALLBACK_TIMEOUT_S)
     except Exception as e:
         # Bounded-delay fail-open: timeouts, 4xx/5xx, network, bad JSON.
         log("ai verify failed (%s) — sending alert unchanged"
@@ -1636,7 +1662,8 @@ def send_daily_digest(conn, manual=False):
     best = conn.execute(
         """SELECT l.*,
                   EXISTS(SELECT 1 FROM alerts a WHERE a.source=l.source
-                         AND a.listing_id=l.id AND a.shadow=0) AS sent_alert,
+                         AND a.listing_id=l.id AND a.shadow=0
+                         AND a.notified_at IS NOT NULL) AS sent_alert,
                   EXISTS(SELECT 1 FROM alerts a WHERE a.source=l.source
                          AND a.listing_id=l.id) AS any_alert
            FROM listings l WHERE l.scored_at >= ? AND l.z IS NOT NULL
@@ -2042,18 +2069,35 @@ class IngestHandler(BaseHTTPRequestHandler):
                 return self._reply(400, {"ok": False})
             if not isinstance(items, list) or len(items) > INGEST_MAX_ITEMS:
                 return self._reply(400, {"ok": False})
-            conn = open_db(DB_PATH)
-            try:
-                stored, skipped = handle_ingest_items(conn, items)
-            finally:
-                conn.close()
-            self._reply(200, {"ok": True, "stored": stored, "skipped": skipped})
+            # ACK BEFORE processing. An alert-bound item can hold this thread
+            # inside the AI gate for a minute-plus — far past the userscript's
+            # 20s client timeout — and a timed-out client re-POSTs the same
+            # batch: listings/alerts stay idempotent, but record_scan rows
+            # multiply (inflating the digest's scan counts and the volume-drop
+            # baseline) and stalled handler threads pile up, each retry able
+            # to hit its own AI stall. The client only ever checks status==200;
+            # the stored/skipped counts in the body were never read. Tradeoff,
+            # accepted: a crash mid-processing now loses that one batch (the
+            # userscript's seen_ids won't resend it) — before, the client
+            # would have retried it. Routine correctness beats crash-window
+            # delivery here.
+            self._reply(200, {"ok": True})
         except Exception as e:
             log("ingest request failed: %s" % e.__class__.__name__)
             try:
                 self._reply(500, {"ok": False})
             except Exception:
                 pass
+            return
+        try:
+            conn = open_db(DB_PATH)
+            try:
+                handle_ingest_items(conn, items)
+            finally:
+                conn.close()
+        except Exception as e:
+            # Already ACKed — never try to write a second HTTP response.
+            log("ingest processing failed: %s" % e.__class__.__name__)
 
 
 def handle_ingest_items(conn, items):
