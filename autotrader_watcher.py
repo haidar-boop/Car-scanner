@@ -88,6 +88,20 @@ DB_PATH = os.environ.get(
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+# AI verification layer — the FINAL gate before a non-shadow alert is sent,
+# strictly after the price-score gate, blocklist and rejection layer have all
+# passed. It runs on the 1-5 listings/day that clear those, never on the ~300
+# that don't; that is what keeps it ~$1-5/month. Fail-open by design: no key,
+# no SDK, an API error or a timeout all degrade to today's behavior (send the
+# alert unchanged). Requires the optional `anthropic` package — a deliberate
+# addition beyond the original requests/bs4/numpy-only constraint.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+AI_VERIFY_ENABLED = os.environ.get("AI_VERIFY_ENABLED", "1") != "0"
+AI_MODEL = "claude-opus-5"
+AI_TIMEOUT_S = 60.0                 # bounded delay; on timeout the alert sends unchanged
+AI_MAX_TOKENS = 4000                # covers adaptive thinking + the small verdict JSON
+AI_MAX_PHOTOS = 5
+
 VERIFY_WARN_COOLDOWN_S = 6 * 3600   # max one search-health warning per label per 6h
 
 # FB->droplet ingest bridge. Empty token = server disabled (never runs open).
@@ -320,6 +334,24 @@ def strip_html(s):
     return TAG_RE.sub(" ", s).strip() or None
 
 
+# The search JSON's images[] carry a size suffix after the extension
+# ("....png/250x188.w") — a 250px thumbnail, useless for damage detection,
+# and the resizer 400s for off-site fetches anyway. The bare URL (suffix
+# stripped) serves the full-resolution original. Verified live 2026-08.
+_PHOTO_SIZE_SUFFIX_RE = re.compile(r"(\.(?:jpe?g|png|webp))/.*$", re.I)
+
+
+def parse_photos(images):
+    """AutoTrader images[] -> JSON array of <=5 full-res URLs, or None."""
+    photos = []
+    for u in (images or []):
+        if isinstance(u, str) and u.startswith("https://"):
+            photos.append(_PHOTO_SIZE_SUFFIX_RE.sub(r"\1", u)[:400])
+            if len(photos) >= AI_MAX_PHOTOS:
+                break
+    return json.dumps(photos) if photos else None
+
+
 def parse_listings(page_props, search_label):
     """Turn pageProps.listings into rows keyed to the DB columns.
 
@@ -369,6 +401,7 @@ def parse_listings(page_props, search_label):
                 "trim_tier": trim_tier,
                 "drivetrain": drivetrain,
                 "model_version": (str(mv)[:200] if mv else None),
+                "photos": parse_photos(l.get("images")),
             })
         except Exception as e:
             log("skipping malformed listing: %s" % e)
@@ -466,6 +499,19 @@ STEP7_LISTING_COLUMNS = {
 STEP8_ALERT_COLUMNS = {
     "notified_at": "TEXT",
 }
+# AI verification layer. photos = JSON array of up to 5 listing photo URLs
+# (AutoTrader: from the embedded search JSON; FB: from item-page enrichment,
+# signed URLs that expire in hours — fine, the AI check runs minutes after
+# discovery, never on a backfill). ai_verdict/ai_summary record the verdict
+# on the alert row so a 'reject' is auditable, excluded from the retry sweep,
+# and a 'caution' summary survives into retried messages.
+STEP9_LISTING_COLUMNS = {
+    "photos": "TEXT",
+}
+STEP9_ALERT_COLUMNS = {
+    "ai_verdict": "TEXT",        # 'clear'|'caution'|'reject'|NULL (not checked)
+    "ai_summary": "TEXT",
+}
 
 STEP2_DDL = """
 CREATE INDEX IF NOT EXISTS idx_listings_family ON listings(family);
@@ -534,7 +580,9 @@ def migrate_db(conn):
                          ("models", STEP6_MODEL_COLUMNS),
                          ("alerts", STEP6_ALERT_COLUMNS),
                          ("listings", STEP7_LISTING_COLUMNS),
-                         ("alerts", STEP8_ALERT_COLUMNS)):
+                         ("alerts", STEP8_ALERT_COLUMNS),
+                         ("listings", STEP9_LISTING_COLUMNS),
+                         ("alerts", STEP9_ALERT_COLUMNS)):
         have = {r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)}
         with conn:
             for name, decl in decls.items():
@@ -636,7 +684,7 @@ def store_listings(conn, rows):
         for r in rows:
             cur = conn.execute(
                 "SELECT price, description, km, enrich_status, trim_tier,"
-                " drivetrain, year, make, model, title FROM listings"
+                " drivetrain, year, make, model, title, photos FROM listings"
                 " WHERE source=? AND id=?",
                 (r["source"], r["id"]),
             )
@@ -649,15 +697,16 @@ def store_listings(conn, rows):
                         result_type, price_label, search_label,
                         first_seen_at, last_seen_at, raw_json,
                         km_converted_from_miles, trim_tier, drivetrain,
-                        model_version, enrich_status)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        model_version, enrich_status, photos)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (r["id"], r["source"], r["url"], r["title"], r["price"],
                      r["year"], r["make"], r["model"], r["km"], r["seller_type"],
                      r["city"], r["distance_km"], r["description"], r["is_damaged"],
                      r["result_type"], r["price_label"], r["search_label"],
                      now, now, r["raw_json"], r.get("km_converted_from_miles"),
                      r.get("trim_tier"), r.get("drivetrain"),
-                     r.get("model_version"), r.get("enrich_status")),
+                     r.get("model_version"), r.get("enrich_status"),
+                     r.get("photos")),
                 )
                 conn.execute(
                     "INSERT INTO price_history (source, id, price, seen_at)"
@@ -689,7 +738,7 @@ def store_listings(conn, rows):
                     # assess but are invisible to COMP_SQL.
                     merged = dict(r)
                     for col in ("description", "km", "trim_tier", "drivetrain",
-                                "year", "make", "model", "title"):
+                                "year", "make", "model", "title", "photos"):
                         if merged.get(col) is None:
                             merged[col] = existing[col]
                     keep_status = existing["enrich_status"]
@@ -702,14 +751,14 @@ def store_listings(conn, rows):
                         "UPDATE listings SET last_seen_at=?, price=?, raw_json=?,"
                         " family=?, fingerprint=?, reject_reason=?,"
                         " trim_tier=?, drivetrain=?, model_version=?,"
-                        " description=?, km=?, enrich_status=?,"
+                        " description=?, km=?, enrich_status=?, photos=?,"
                         " year=?, make=?, model=?, title=?,"
                         " z=NULL, pct_below=NULL, scored_at=NULL"
                         " WHERE source=? AND id=?",
                         (now, r["price"], r["raw_json"], family, fp, reason,
                          merged.get("trim_tier"), merged.get("drivetrain"),
                          merged.get("model_version"), merged.get("description"),
-                         merged.get("km"), keep_status,
+                         merged.get("km"), keep_status, merged.get("photos"),
                          merged.get("year"), merged.get("make"),
                          merged.get("model"), merged.get("title"),
                          r["source"], r["id"]),
@@ -811,6 +860,16 @@ def format_alert(row, score, predicted_price, shadow, first_seen_at=None):
         lines.append(" · ".join(marks))
     lines.append(row.get("url") or "")   # URL last so it stays tappable
     return "\n".join(l for l in lines if l)
+
+
+def _insert_before_url(msg, note):
+    """Add a line to an alert message ABOVE its trailing URL — format_alert
+    deliberately puts the URL last so it stays tappable on a phone, and an
+    appended AI note must not break that."""
+    head, _, tail = msg.rpartition("\n")
+    if head and tail.startswith("http"):
+        return head + "\n" + note + "\n" + tail
+    return msg + "\n" + note
 
 
 # --test routes every incidental send here instead of the network, so the
@@ -982,6 +1041,180 @@ def score_listing(conn, row):
             "unpriced_features": unpriced}
 
 
+# --- AI verification (final gate, strictly after all other filters) ---------
+
+AI_SYSTEM_PROMPT = """\
+You are the final human-facing check in a used-car deal-alert system for
+Edmonton, Alberta. Every listing you see has already passed a statistical
+price filter: it is priced significantly below what comparable vehicles
+(same make/model/year/mileage/trim) are asking. Your job is NOT to judge
+whether the price is good — that's already been decided. Your job is to
+judge whether there's a visible reason the price is low that a human
+buyer would want to know about before driving out to see it.
+
+You will be given the listing's title, full description text, asking
+price, statistical discount (z-score and percent below predicted), and
+up to 5 photos from the listing.
+
+Look for, using BOTH the text and the photos:
+1. VISIBLE DAMAGE — dents, rust, mismatched paint, cracked glass, bent
+   panels, missing trim, warning lights on the dash in an interior shot,
+   flood/water lines, anything a buyer should be warned about before
+   going to see the car in person.
+2. UNDISCLOSED MECHANICAL ISSUES mentioned in the text but easy to miss —
+   "needs a transmission," "runs but," "sold as-is for parts," "check
+   engine light," "head gasket," etc., especially phrased in ways a
+   simple keyword filter would miss (typos, French, slang, indirect
+   phrasing).
+3. SALVAGE / REBUILT / INSURANCE SIGNALS not caught by an exact-keyword
+   list — "clean bill from insurance after," "back on the road after,"
+   "no accident *reported*," odd phrasing that hints at a branded title
+   without using the word.
+4. SCAM PATTERNS — a stock/dealer/brochure photo paired with a private
+   seller price; photos that don't match the described trim, color, or
+   interior; seller pushing off-platform contact, wire transfer,
+   shipping, "car is out of country," urgency pressure, or refusing a
+   test drive; price that is dramatically below EVERY comparable, not
+   just modestly below.
+5. PHOTO/LISTING MISMATCH — interior condition inconsistent with the
+   claimed mileage, a visibly different vehicle in one of the photos,
+   watermarks from another marketplace or dealer site.
+
+You are the LAST gate before this alert reaches a human's phone. Default
+to letting it through. A missed warning costs the buyer ten minutes of
+looking at a bad car in person. A wrongly suppressed alert costs them a
+genuinely good deal they'll never know they missed — that is the more
+expensive mistake. Only escalate to REJECT when you are confident this
+is fraudulent, not merely imperfect.
+
+Respond with a structured verdict — no prose outside the fields:
+
+- damage_visible: true/false
+- damage_notes: one short phrase, or null
+- scam_risk: "none" | "low" | "medium" | "high"
+- scam_notes: one short phrase, or null
+- undisclosed_issues: one short phrase quoting/paraphrasing the listing, or null
+- verdict: "clear" | "caution" | "reject"
+    clear   = nothing notable, send the alert as-is
+    caution = send the alert, but attach a one-line warning
+    reject  = do not alert; this is very likely fraudulent or the
+              vehicle is materially misrepresented (reserve for high
+              scam_risk or unmistakable damage the title/price implies
+              should be pristine)
+- summary: ONE short line (under 100 characters) suitable for appending
+  directly to a Telegram message, e.g. "clean, no red flags" or
+  "⚠️ rear quarter panel damage visible in photo 3" or
+  "⚠️ stock photos, private-seller price — verify in person"
+"""
+
+AI_USER_TEMPLATE = """\
+Listing under review — already passed the price-score filter.
+
+Vehicle: %(vehicle)s
+Asking price: $%(price)s
+Statistical read: %(pct_below)d%% below predicted ($%(predicted)s), z=%(z).2f
+Seller type: %(seller_type)s
+Source: %(source)s (%(url)s)
+
+Title as posted:
+%(title)s
+
+Full description as posted:
+%(description)s
+
+Evaluate per your instructions and return the structured verdict."""
+
+AI_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "damage_visible": {"type": "boolean"},
+        "damage_notes": {"type": ["string", "null"]},
+        "scam_risk": {"type": "string", "enum": ["none", "low", "medium", "high"]},
+        "scam_notes": {"type": ["string", "null"]},
+        "undisclosed_issues": {"type": ["string", "null"]},
+        "verdict": {"type": "string", "enum": ["clear", "caution", "reject"]},
+        "summary": {"type": "string"},
+    },
+    "required": ["damage_visible", "damage_notes", "scam_risk", "scam_notes",
+                 "undisclosed_issues", "verdict", "summary"],
+    "additionalProperties": False,
+}
+
+_AI_UNAVAILABLE_LOGGED = False
+
+
+def ai_verify(row, score, predicted):
+    """One Claude call on an alert-bound listing. Returns the verdict dict or
+    None — and None ALWAYS means "send the alert unchanged" (fail-open).
+
+    Runs strictly AFTER the price gate, blocklist and rejection layer: only
+    maybe_alert's non-shadow path calls this, so it sees the 1-5 listings a
+    day that earned an alert, never the ~300 that didn't. Every failure mode
+    (kill switch, no key, SDK missing, API error, timeout, malformed reply)
+    degrades to today's behavior rather than suppressing or delaying a real
+    alert beyond the bounded timeout.
+    """
+    global _AI_UNAVAILABLE_LOGGED
+    if not AI_VERIFY_ENABLED or not ANTHROPIC_API_KEY:
+        return None
+    if _SUPPRESSED_SENDS is not None:
+        return None  # --test must never spend real API money
+    try:
+        import anthropic
+    except ImportError:
+        if not _AI_UNAVAILABLE_LOGGED:
+            _AI_UNAVAILABLE_LOGGED = True
+            log("ai verify unavailable: anthropic SDK not installed"
+                " (pip install anthropic) — alerts send unchanged")
+        return None
+    try:
+        photos = row.get("photos")
+        if isinstance(photos, str):
+            try:
+                photos = json.loads(photos)
+            except ValueError:
+                photos = None
+        if not isinstance(photos, list):
+            photos = []
+        photos = [u for u in photos
+                  if isinstance(u, str) and u.startswith("https://")][:AI_MAX_PHOTOS]
+        content = [{"type": "image", "source": {"type": "url", "url": u}}
+                   for u in photos]
+        content.append({"type": "text", "text": AI_USER_TEMPLATE % {
+            "vehicle": vehicle_line(row),
+            "price": format(row["price"], ","),
+            "pct_below": round(score["pct_below"]),
+            "predicted": format(predicted, ","),
+            "z": score["z"],
+            "seller_type": row.get("seller_type") or "n/a",
+            "source": row.get("source") or "n/a",
+            "url": row.get("url") or "n/a",
+            "title": (row.get("title") or "(none)")[:300],
+            "description": (row.get("description") or "(no description)")[:2000],
+        }})
+        client = anthropic.Anthropic(
+            api_key=ANTHROPIC_API_KEY, timeout=AI_TIMEOUT_S, max_retries=0)
+        resp = client.messages.create(
+            model=AI_MODEL,
+            max_tokens=AI_MAX_TOKENS,
+            thinking={"type": "adaptive"},
+            system=AI_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": content}],
+            output_config={"format": {"type": "json_schema", "schema": AI_SCHEMA}},
+        )
+        text = next(b.text for b in resp.content if b.type == "text")
+        out = json.loads(text)
+        if out.get("verdict") not in ("clear", "caution", "reject"):
+            return None
+        out["summary"] = str(out.get("summary") or "")[:160]
+        return out
+    except Exception as e:
+        # Bounded-delay fail-open: timeouts, 4xx/5xx, network, bad JSON.
+        log("ai verify failed (%s) — sending alert unchanged"
+            % e.__class__.__name__)
+        return None
+
+
 def maybe_alert(conn, row, score):
     src, lid = row["source"], row["id"]
     if score["suppress"]:
@@ -1040,12 +1273,35 @@ def maybe_alert(conn, row, score):
         low_confidence=bool(score["low_confidence"]),
         adjustments=len(score["adjustments"]))
     if not shadow:
+        # AI verification — the FINAL gate, after every other filter has
+        # already passed. ai_verify is fail-open: None = send unchanged.
+        ai = ai_verify(row, score, predicted)
+        if ai:
+            with conn:
+                conn.execute(
+                    "UPDATE alerts SET ai_verdict=?, ai_summary=?"
+                    " WHERE alert_id=?",
+                    (ai["verdict"], ai.get("summary") or None, cur.lastrowid))
+        if ai and ai["verdict"] == "reject":
+            # Suppressed, not vanished: the alert row above keeps the full
+            # score plus the verdict for later audit (--label still works on
+            # it), and retry_failed_alerts explicitly skips rejects so this
+            # never resurfaces as a "pending" send.
+            log("[ai_reject] #%d %s/%s: %s"
+                % (cur.lastrowid, src, lid, ai.get("summary") or "no summary"),
+                event="ai_reject", alert_id=cur.lastrowid, source=src,
+                listing_id=lid, summary=ai.get("summary") or "",
+                scam_risk=ai.get("scam_risk"),
+                damage_visible=bool(ai.get("damage_visible")))
+            return
         seen_row = conn.execute(
             "SELECT first_seen_at FROM listings WHERE source=? AND id=?",
             (src, lid)).fetchone()
-        delivered = telegram_send(format_alert(
-            row, score, predicted, shadow,
-            seen_row["first_seen_at"] if seen_row else None))
+        msg = format_alert(row, score, predicted, shadow,
+                           seen_row["first_seen_at"] if seen_row else None)
+        if ai and ai["verdict"] == "caution" and ai.get("summary"):
+            msg = _insert_before_url(msg, "🤖 " + ai["summary"])
+        delivered = telegram_send(msg)
         # notified_at stays NULL on failure — the alert row is already
         # committed above (it must survive a Telegram outage), and
         # retry_failed_alerts() sweeps anything still NULL every cycle.
@@ -1080,15 +1336,18 @@ def retry_failed_alerts(conn):
     """
     cutoff = (datetime.now(timezone.utc)
               - timedelta(seconds=ALERT_RETRY_GRACE_S)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # ai_verdict='reject' rows are DELIBERATE suppressions, not failed sends
+    # — sweeping them would undo the AI gate on the very next cycle.
     rows = conn.execute(
         """SELECT a.alert_id, a.source, a.listing_id, a.z, a.pct_below,
                   a.price, a.predicted_price, a.model_key, a.comp_count,
-                  a.low_confidence, a.adjustments,
+                  a.low_confidence, a.adjustments, a.ai_verdict, a.ai_summary,
                   l.km, l.url, l.city, l.seller_type, l.title,
                   l.year, l.make, l.model, l.first_seen_at
            FROM alerts a JOIN listings l
              ON l.source = a.source AND l.id = a.listing_id
-           WHERE a.shadow = 0 AND a.notified_at IS NULL AND a.fired_at <= ?""",
+           WHERE a.shadow = 0 AND a.notified_at IS NULL AND a.fired_at <= ?
+             AND (a.ai_verdict IS NULL OR a.ai_verdict != 'reject')""",
         (cutoff,)
     ).fetchall()
     for r in rows:
@@ -1101,8 +1360,11 @@ def retry_failed_alerts(conn):
                            "comp_count": r["comp_count"]},
                  "low_confidence": bool(r["low_confidence"]),
                  "adjustments": json.loads(r["adjustments"]) if r["adjustments"] else []}
-        delivered = telegram_send(format_alert(
-            row, score, r["predicted_price"], False, r["first_seen_at"]))
+        msg = format_alert(row, score, r["predicted_price"], False,
+                           r["first_seen_at"])
+        if r["ai_verdict"] == "caution" and r["ai_summary"]:
+            msg = _insert_before_url(msg, "🤖 " + r["ai_summary"])
+        delivered = telegram_send(msg)
         if delivered:
             with conn:
                 conn.execute("UPDATE alerts SET notified_at=? WHERE alert_id=?",
@@ -1349,13 +1611,17 @@ def send_daily_digest(conn, manual=False):
         by_source[s["source"]] = by_source.get(s["source"], 0) + (s["parsed"] or 0)
 
     alerts = conn.execute(
-        "SELECT shadow, notified_at FROM alerts WHERE fired_at >= ?",
+        "SELECT shadow, notified_at, ai_verdict FROM alerts WHERE fired_at >= ?",
         (since,)).fetchall()
     # notified_at distinguishes an actually-delivered alert from one that
     # fired but is still waiting on retry_failed_alerts() — a Telegram
-    # outage must show up here, not read as "sent" when it wasn't.
+    # outage must show up here, not read as "sent" when it wasn't. An
+    # AI-rejected alert is a deliberate suppression, not a pending send.
     sent = sum(1 for a in alerts if not a["shadow"] and a["notified_at"])
-    pending = sum(1 for a in alerts if not a["shadow"] and not a["notified_at"])
+    ai_rejected = sum(1 for a in alerts
+                      if not a["shadow"] and a["ai_verdict"] == "reject")
+    pending = sum(1 for a in alerts if not a["shadow"] and not a["notified_at"]
+                  and a["ai_verdict"] != "reject")
     shadowed = sum(1 for a in alerts if a["shadow"])
 
     rejects = conn.execute(
@@ -1403,8 +1669,10 @@ def send_daily_digest(conn, manual=False):
         lines.append("  " + " · ".join(
             "%s:%s %d" % (tag.get(s["source"], s["source"]), s["search_label"],
                           s["parsed"] or 0) for s in scans))
-    lines.append("Alerts: %d sent · %d shadow%s" % (
-        sent, shadowed, " · %d pending retry" % pending if pending else ""))
+    lines.append("Alerts: %d sent · %d shadow%s%s" % (
+        sent, shadowed,
+        " · %d pending retry" % pending if pending else "",
+        " · %d ai-rejected" % ai_rejected if ai_rejected else ""))
     lines.append("Rejected %d: %s" % (
         sum(by_reason.values()),
         " · ".join("%s %d" % kv for kv in sorted(
@@ -2127,6 +2395,25 @@ def run_test():
             if err_counts:
                 print("  errors: " + " · ".join(
                     "%s %d" % kv for kv in err_counts.most_common(6)))
+
+        print("\n--- 5c. AI VERIFICATION ------------------------------------------")
+        try:
+            import anthropic  # noqa: F401
+            sdk = "installed"
+        except ImportError:
+            sdk = "NOT installed (pip install anthropic)"
+        print("  enabled: %s · SDK: %s · key: %s"
+              % ("yes" if AI_VERIFY_ENABLED else "no (AI_VERIFY_ENABLED=0)",
+                 sdk, "set" if ANTHROPIC_API_KEY else "NOT set"))
+        print("  --test never calls the API (no cost, and the 'exactly one"
+              " message' guarantee holds); in live runs the check gates only"
+              " non-shadow alerts, fail-open.")
+        ai_counts = conn.execute(
+            """SELECT ai_verdict, COUNT(*) FROM alerts
+               WHERE ai_verdict IS NOT NULL GROUP BY ai_verdict""").fetchall()
+        if ai_counts:
+            print("  verdicts to date: " + " · ".join(
+                "%s %d" % (r[0], r[1]) for r in ai_counts))
 
         print("\n--- 6. TELEGRAM --------------------------------------------------")
         suppressed = list(_SUPPRESSED_SENDS)

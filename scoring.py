@@ -546,6 +546,17 @@ def known_vehicles(conn):
     return {"makes": makes, "models_by_make": models}
 
 
+def _parse_photos_field(photos):
+    """Enrichment photos -> JSON array of <=5 https URLs, or None. FB photo
+    URLs are signed and expire within hours — fine for the AI check, which
+    runs minutes after discovery, never on a backfill."""
+    if not isinstance(photos, list):
+        return None
+    urls = [str(u)[:400] for u in photos
+            if isinstance(u, str) and u.startswith("https://")][:5]
+    return json.dumps(urls) if urls else None
+
+
 def parse_fb_listing(item, known, now_iso):
     """Ingest item {id,url,price_text,text,label,seen_at,seed} -> store row,
     plus optional enrichment fields fetched from the listing's own page:
@@ -671,6 +682,7 @@ def parse_fb_listing(item, known, now_iso):
         "drivetrain": drivetrain,
         "model_version": None,
         "enrich_status": status,
+        "photos": _parse_photos_field(item.get("photos")),
         "raw_json": json.dumps(raw),
     }
 

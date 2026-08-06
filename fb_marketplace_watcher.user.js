@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FB Marketplace Car Watcher (Edmonton)
 // @namespace    car-scanner
-// @version      0.4.0
+// @version      0.5.0
 // @description  Rotates a pinned tab through Edmonton car/truck/SUV searches, posts scraped listings to the droplet scorer
 // @match        https://www.facebook.com/marketplace/*
 // @grant        GM_setValue
@@ -241,6 +241,26 @@
          (m) => { extra.seller_type = JSON.parse(m[1]).slice(0, 40); });
     grab("vehicle_is_paid_off", /"vehicle_is_paid_off"\s*:\s*(true|false)/,
          (m) => { extra.paid_off = m[1] === "true"; });
+    // Photo URLs for the droplet's AI verification gate. Like every key in
+    // this table, "listing_photos" is an ASSUMPTION until the first real
+    // run — the telemetry (enrich_keys) says whether it matched. Scoped to
+    // a bounded window after the key so profile pictures and "more like
+    // this" images elsewhere in the page can't leak in. The URIs are
+    // signed and expire in hours; that's fine, the AI check runs minutes
+    // after discovery.
+    grab("listing_photos", /"listing_photos"\s*:\s*\[/,
+         (m) => {
+           const win = html.slice(m.index, m.index + 40000);
+           const re = /"image"\s*:\s*\{[^{}]*?"uri"\s*:\s*("(?:[^"\\]|\\.)*")/g;
+           const urls = [];
+           let mm;
+           while (urls.length < 5 && (mm = re.exec(win))) {
+             const u = JSON.parse(mm[1]);
+             if (/^https:\/\//.test(u)) urls.push(u.slice(0, 400));
+           }
+           if (!urls.length) throw new Error("shape");
+           fields.photos = urls;
+         });
     if (Object.keys(extra).length) fields.enrich_extra = extra;
     return { fields: fields, keys: keys.slice(0, 10) };
   }

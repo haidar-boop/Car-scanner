@@ -337,12 +337,58 @@ Sunday 6 PM a weekly report lands in Telegram: alerts fired, labeled precision,
 and blocklist-term suggestions mined from bad/scam-labeled listings. Manual
 triggers: `--digest`, `--report` (both send immediately and exit).
 
+## AI verification (optional)
+
+The last gate before a Telegram alert fires — strictly **after** the price
+gate, blocklist and rejection layer have all passed. A single Claude call
+(model `claude-opus-5`) reads the listing's title, full description and up
+to 5 photos, and returns one of three verdicts:
+
+- **clear** — alert sends unchanged.
+- **caution** — alert sends with a one-line 🤖 note (e.g. "rear quarter
+  panel damage visible in photo 3") inserted above the URL.
+- **reject** — alert is suppressed. Reserved for high-confidence fraud or
+  unmistakable damage; the alert row is still written with the verdict, so
+  it shows in the digest as `N ai-rejected`, stays labelable via `--label`,
+  and is never resurrected by the delivery-retry sweep.
+
+Why it exists: the blocklist is exact keyword matching — "bent frame" in
+prose, a salvage-yard background, or a stock dealer photo on a private
+listing all sail past it. The AI reads like a person. It is biased toward
+letting alerts through: a missed warning costs ten minutes of your time; a
+wrongly suppressed real deal costs the deal.
+
+**Cost.** It runs only on alert-bound listings (the 1-5/day that clear
+every other gate), never the ~300/day scanned. Roughly **$1-5/month**.
+
+**Setup.** `pip install anthropic` (a deliberate optional extra beyond the
+core requests/bs4/numpy stack), then set `ANTHROPIC_API_KEY` in
+`/etc/car-scanner.env` (key from console.anthropic.com, pay-as-you-go).
+`AI_VERIFY_ENABLED=0` is the kill switch.
+
+**Fail-open guarantee.** No key, SDK not installed, API error, or timeout
+(60 s cap) — the alert sends exactly as it does today, unchanged and
+undelayed beyond that cap. The feature can only ever *annotate or
+suppress* an alert the scorer already fired; it never touches scoring,
+comps, or the rejection layer, and `--test` never calls the API.
+
+Photo sources: AutoTrader photos come free with the search JSON we already
+store (full-resolution originals). Facebook photos ride the item-page
+enrichment fetch — the `listing_photos` extractor key is an assumption
+until the first real run, like every key in that table; check `--test`
+section 5b's `keys matched` line. FB photo URLs are signed and expire in
+hours, which is fine: the check runs minutes after discovery, never on a
+backfill.
+
 ## Install (droplet)
 
 ```sh
 apt update && apt install -y python3-requests python3-bs4 python3-numpy
 # (Debian 12 / Ubuntu 23.04+ block bare pip3 installs — PEP 668. If you'd
 #  rather use pip, make a venv and point the unit's ExecStart at its python.)
+# Optional, for the AI verification gate (see section above):
+#   apt install -y python3-pip && pip3 install --break-system-packages anthropic
+#   (or use a venv; the scanner runs fine without it — alerts just skip the AI check)
 mkdir -p /opt/car-scanner && cp autotrader_watcher.py scoring.py /opt/car-scanner/
 cp car-scanner.env.example /etc/car-scanner.env  # fill in real values
 chmod 600 /etc/car-scanner.env
