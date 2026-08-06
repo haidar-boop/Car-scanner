@@ -1376,14 +1376,24 @@ def send_daily_digest(conn, manual=False):
            FROM listings l WHERE l.scored_at >= ? AND l.z IS NOT NULL
            ORDER BY l.z ASC LIMIT 5""", (since,)).fetchall()
 
+    def _local(iso_str, fmt="%a %H:%M"):
+        """UTC-stored timestamp -> local wall clock. Every time shown to the
+        user is local; mixing in a raw UTC string made the truncation notice
+        contradict the header directly above it by the 6-7h offset."""
+        try:
+            return (datetime.strptime(iso_str, "%Y-%m-%dT%H:%M:%SZ")
+                    .replace(tzinfo=timezone.utc).astimezone(TZ).strftime(fmt))
+        except (ValueError, TypeError):
+            return iso_str or "?"
+
     lines = ["📊 DIGEST — %s (since %s)" % (
-        datetime.now(TZ).strftime("%a %d %b"),
-        datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ")
-                .replace(tzinfo=timezone.utc).astimezone(TZ).strftime("%a %H:%M"))]
+        datetime.now(TZ).strftime("%a %d %b"), _local(since))]
     if truncated_from:
         lines.append("⚠️ window capped at %d days — %s to %s went unreported "
                      "(digest was down that long)"
-                     % (DIGEST_MAX_LOOKBACK_DAYS, truncated_from[:16], since[:16]))
+                     % (DIGEST_MAX_LOOKBACK_DAYS,
+                        _local(truncated_from, "%a %d %b %H:%M"),
+                        _local(since, "%a %d %b %H:%M")))
     lines.append("Scanned: " + (" · ".join(
         "%s %d" % (src, n) for src, n in sorted(by_source.items())) or "nothing"))
     if scans:

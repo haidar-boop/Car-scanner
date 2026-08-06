@@ -992,7 +992,13 @@ def mine_blocklist_candidates(bad_texts, good_texts, extra_exclude=()):
     exclude = {t.lower() for t in BLOCKLIST_TERMS}
     exclude |= {m.lower() for m in STATIC_MAKES}
     exclude |= {str(t).lower() for t in extra_exclude}
-    exclude_words = [tuple(e.split()) for e in exclude]
+    # Tokenize exclusions the SAME way candidates are tokenized below.
+    # str.split() splits on whitespace only, so hyphenated entries like
+    # 'mercedes-benz' or 'write-off' stayed one token and could never match
+    # a candidate word — which un-suppressed 'mercedes' and 'benz' and let
+    # the miner recommend blocklisting a make, silently rejecting every
+    # listing of it.
+    exclude_words = [tuple(re.findall(r"[a-z']+", e)) for e in exclude]
 
     def grams(text):
         toks = re.findall(r"\b[a-z']{2,}\b", (text or "").lower())

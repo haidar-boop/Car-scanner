@@ -607,6 +607,7 @@
   let seedPrevCount = -1;
   let seedStableTicks = 0;
   let seedTicks = 0;
+  let seedLabel = null;           // which search the counters above describe
 
   function warnScraperBlind() {
     if (emptyWarned) return;
@@ -705,6 +706,14 @@
       return; // navigated to an item/home page — that's normal, stay quiet
     }
     wasActive = true;
+    // Back on a configured search after an SPA drift: retract the banner and
+    // re-arm the warning. Without this the red "alerts suspended" banner
+    // outlived the condition it described, since nothing else clears "lost".
+    if (lostWarned) {
+      lostWarned = false;
+      setBanner(false, null, "lost");
+      console.log("[car-watcher] back on a configured search — alerting resumed");
+    }
     const sortOk = checkSortGuard();
     if (!sortOk) return; // don't notify AND don't mark seen: listings that
                          // appear while the sort is broken must still alert
@@ -747,9 +756,24 @@
     }
     if (dirty) saveSeen(seenArr);
     if (seeding) {
+      // An SPA navigation between two configured searches keeps these
+      // page-local counters alive, so the previous label's tick count and
+      // high-water mark would latch the NEW label on its very first,
+      // partial tick — the exact behavior this fix exists to remove.
+      if (seedLabel !== search.label) {
+        seedLabel = search.label;
+        seedPrevCount = -1;
+        seedStableTicks = 0;
+        seedTicks = 0;
+      }
       seedTicks += 1;
-      if (listings.length > seedPrevCount) {
-        seedPrevCount = listings.length;   // grid still filling in
+      // Any CHANGE resets the stability counter, not just growth. Comparing
+      // against a high-water mark treated a shrink as stability, but a
+      // shrink means the grid is still churning (FB re-renders and unmounts
+      // rows as results stream in) — the least safe moment to latch.
+      // SEED_MAX_TICKS still bounds a grid that oscillates forever.
+      if (listings.length !== seedPrevCount) {
+        seedPrevCount = listings.length;   // grid still settling
         seedStableTicks = 0;
       } else {
         seedStableTicks += 1;
