@@ -979,11 +979,20 @@ _MINE_STOPWORDS = {
 }
 
 
+def _phrase_contains(hay_words, needle_words):
+    """True if needle's word sequence appears contiguously inside hay's."""
+    n, h = len(needle_words), len(hay_words)
+    if not n or n > h:
+        return False
+    return any(hay_words[i:i + n] == needle_words for i in range(h - n + 1))
+
+
 def mine_blocklist_candidates(bad_texts, good_texts, extra_exclude=()):
     """Terms frequent in bad/scam-labeled listings but rare in clean ones."""
     exclude = {t.lower() for t in BLOCKLIST_TERMS}
     exclude |= {m.lower() for m in STATIC_MAKES}
     exclude |= {str(t).lower() for t in extra_exclude}
+    exclude_words = [tuple(e.split()) for e in exclude]
 
     def grams(text):
         toks = re.findall(r"\b[a-z']{2,}\b", (text or "").lower())
@@ -1003,7 +1012,17 @@ def mine_blocklist_candidates(bad_texts, good_texts, extra_exclude=()):
 
     out = []
     for g, bdf in bad_df.items():
-        if bdf < 2 or g in exclude or any(g in e or e in g for e in exclude):
+        # Near-duplicate suppression compares WHOLE WORDS, not raw
+        # substrings. Bare containment silently killed any candidate that
+        # merely spelled a make inside it: 'ram' is a make, so 'frame',
+        # 'bent frame' and 'frame damage' — the highest-value terms in a
+        # rust-and-hail market — could never be surfaced. Same for 'mini'
+        # inside 'minimum'. It also worsened over time, since the caller
+        # passes the DB-learned make set, which only grows.
+        gw = tuple(g.split())
+        if bdf < 2 or g in exclude or any(
+                _phrase_contains(gw, ew) or _phrase_contains(ew, gw)
+                for ew in exclude_words):
             continue
         ratio = bdf / (good_df.get(g, 0) + 1)
         if ratio >= 3:

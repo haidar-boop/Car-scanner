@@ -120,6 +120,7 @@ LIFESPAN_CHECK_CAP = 20                # max direct re-fetches per poll cycle
 LIFESPAN_MAX_DAYS = 7                  # stop checking once a listing is this old
 REFIT_HOUR_LOCAL = 3                   # nightly model refit (America/Edmonton)
 DIGEST_HOUR_LOCAL = 20                 # shadow digest at 8 PM local
+DIGEST_MAX_LOOKBACK_DAYS = 7           # cap after an outage; never a forward snap
 WEEKLY_REPORT_DOW = 6                  # Sunday
 WEEKLY_REPORT_HOUR_LOCAL = 18
 
@@ -1325,10 +1326,20 @@ def send_daily_digest(conn, manual=False):
     # Window from the previous digest, NOT local midnight: the digest fires at
     # 20:00, so a midnight anchor would drop 20:00-to-midnight into a hole no
     # digest ever covers — prime private-seller posting hours.
+    # The lookback is capped so one long outage can't build an enormous
+    # digest — but it must never snap FORWARD to a fresh 24h window, which
+    # is what the old 2-day floor did: a single missed evening orphaned
+    # [last_digest_at, now-24h] into a gap no digest ever covered, silently.
+    # Poll jitter alone pushed the gap past 48h routinely. When the cap
+    # bites, the digest says so instead of dropping the period in silence.
     since = meta_get(conn, "last_digest_at")
-    floor = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    if not since or since < floor:
+    truncated_from = None
+    cap = (datetime.now(timezone.utc)
+           - timedelta(days=DIGEST_MAX_LOOKBACK_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if not since:
         since = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    elif since < cap:
+        truncated_from, since = since, cap
     scans = conn.execute(
         """SELECT source, search_label, SUM(parsed_count) AS parsed
            FROM scans WHERE scanned_at >= ? GROUP BY source, search_label
@@ -1369,6 +1380,10 @@ def send_daily_digest(conn, manual=False):
         datetime.now(TZ).strftime("%a %d %b"),
         datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ")
                 .replace(tzinfo=timezone.utc).astimezone(TZ).strftime("%a %H:%M"))]
+    if truncated_from:
+        lines.append("⚠️ window capped at %d days — %s to %s went unreported "
+                     "(digest was down that long)"
+                     % (DIGEST_MAX_LOOKBACK_DAYS, truncated_from[:16], since[:16]))
     lines.append("Scanned: " + (" · ".join(
         "%s %d" % (src, n) for src, n in sorted(by_source.items())) or "nothing"))
     if scans:
@@ -1502,8 +1517,10 @@ def send_weekly_report(conn):
     if gone[0]:
         lines.append("lifespan: %d tracked listings disappeared, %d within 48h"
                      % (gone[0], gone[1] or 0))
-    telegram_send("\n\n".join(lines))
-    log("weekly report sent (%d alerts, %d labeled)" % (len(alerts), judged))
+    ok = telegram_send("\n\n".join(lines))
+    log("weekly report %s (%d alerts, %d labeled)"
+        % ("sent" if ok else "FAILED to send", len(alerts), judged))
+    return ok
 
 
 def maybe_weekly_report(conn):
@@ -1512,8 +1529,11 @@ def maybe_weekly_report(conn):
     if (now_local.weekday() == WEEKLY_REPORT_DOW
             and now_local.hour >= WEEKLY_REPORT_HOUR_LOCAL
             and meta_get(conn, "last_weekly_date") != today):
-        send_weekly_report(conn)
-        meta_set(conn, "last_weekly_date", today)
+        # Only mark the week done once it actually arrived — stamping on a
+        # failed send skipped the report until the NEXT Sunday, by which
+        # time its 7-day window has rolled past most of the lost content.
+        if send_weekly_report(conn):
+            meta_set(conn, "last_weekly_date", today)
 
 
 def check_scan_volume(conn):

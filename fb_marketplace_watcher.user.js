@@ -236,11 +236,21 @@
     return { fields: fields, keys: keys.slice(0, 10) };
   }
 
+  // FB writes this apostrophe four different ways depending on where the
+  // string comes from: a curly U+2019 in rendered UI text, HTML entities in
+  // server markup, and a ' escape inside embedded JSON (which is how
+  // most page strings ship). Matching only the ASCII form meant sold
+  // listings fell through to "no_keys" — the signature reserved for "FB
+  // renamed their JSON keys" — so ordinary listing churn faked that alarm.
+  const APOS = "(?:['’ʼ]|&#0?39;|&#x27;|&apos;|\\\\u0027)?";
+  const UNAVAILABLE_RE = new RegExp(
+    "content isn" + APOS + "t available|isn" + APOS + "t available right now", "i");
+
   function isUnavailablePage(status, html) {
     // A sold/deleted listing, NOT a block — these vanish within minutes in a
     // hot market and must never trip the 6h disable.
     if (status === 404) return true;
-    return /content isn'?t available|isn'?t available right now/i.test(html || "");
+    return UNAVAILABLE_RE.test(html || "");
   }
 
   function detectBlocked(status, finalUrl, html) {
@@ -268,18 +278,26 @@
   let enrichTimer = null;
   let enrichQueuedThisTick = 0;   // reset in tick()
 
+  // A true rolling hour, not a clock-hour bucket. A fixed bucket reset at the
+  // top of each hour, so 30 dispatches at :59 plus 30 at :00 put 60 item-page
+  // fetches inside two minutes — double the rate the cap exists to enforce,
+  // and burst rate is exactly the bot signature the caps are here to avoid.
+  function enrichRecentDispatches() {
+    const arr = GM_getValue("enrich_dispatch_log", []);
+    if (!Array.isArray(arr)) return [];
+    const cutoff = Date.now() - 3600000;
+    return arr.filter((t) => typeof t === "number" && t > cutoff);
+  }
+
   function enrichHourBudgetLeft() {
-    const hour = Math.floor(Date.now() / 3600000);
-    const bucket = GM_getValue("enrich_hour_bucket", { hour: 0, n: 0 });
-    return ENRICH_HOURLY_CAP - (bucket.hour === hour ? bucket.n : 0);
+    return ENRICH_HOURLY_CAP - enrichRecentDispatches().length;
   }
 
   function enrichCountDispatch() {
-    const hour = Math.floor(Date.now() / 3600000);
-    const bucket = GM_getValue("enrich_hour_bucket", { hour: 0, n: 0 });
-    GM_setValue("enrich_hour_bucket",
-                bucket.hour === hour ? { hour: hour, n: bucket.n + 1 }
-                                     : { hour: hour, n: 1 });
+    const arr = enrichRecentDispatches();
+    arr.push(Date.now());
+    // Bounded so a stuck clock or a burst can't grow the stored log forever.
+    GM_setValue("enrich_dispatch_log", arr.slice(-ENRICH_HOURLY_CAP * 4));
   }
 
   function maybeEnrich(payload) {
@@ -395,9 +413,15 @@
     removeFromQueue(entry);
     if (!resp) {
       shipBare(entry, errKind || "network");
-    } else if (isUnavailablePage(resp.status, resp.responseText)) {
-      shipBare(entry, "unavailable");  // sold/deleted — expected, not a block
     } else {
+      // Block detection MUST run first: FB's generic "content isn't
+      // available" copy is also its permission-denied text, so a login or
+      // checkpoint wall carrying that string used to be downgraded to a
+      // benign sold-listing and the 6h disable never armed — leaving the
+      // script hammering a login wall, the exact account-flag scenario the
+      // disable exists to prevent. A real 404/sold page trips none of
+      // detectBlocked's status, URL, or login-form markers, so it still
+      // falls through to "unavailable" below.
       const blocked = detectBlocked(resp.status, resp.finalUrl, resp.responseText);
       if (blocked) {
         GM_setValue("enrich_disabled_until", Date.now() + ENRICH_DISABLE_MS);
@@ -413,6 +437,8 @@
         const rest = GM_getValue("enrich_queue", []);
         for (const e of rest) shipBare(e, "disabled");
         GM_setValue("enrich_queue", []);
+      } else if (isUnavailablePage(resp.status, resp.responseText)) {
+        shipBare(entry, "unavailable");  // sold/deleted — expected, not a block
       } else if (resp.status !== 200) {
         shipBare(entry, "http_" + resp.status);
       } else {
@@ -532,19 +558,34 @@
     GM_setValue("seen_ids", ids.slice(-SEEN_CAP));
   }
 
-  function setBanner(show, text) {
+  // Banners are keyed by which alarm raised them. A single shared element
+  // meant whoever cleared it last won: checkSortGuard's setBanner(false) on
+  // every healthy tick wiped the "scraper may be blind" banner one tick
+  // after it appeared, and the emptyWarned latch stopped it ever coming
+  // back — so the tab looked fine while the scraper was blind. Each alarm
+  // now owns its own reason and can only clear its own.
+  const bannerReasons = new Map();
+
+  function renderBanner() {
     const existing = document.getElementById("car-watcher-warning");
-    if (!show) {
+    if (!bannerReasons.size) {
       if (existing) existing.remove();
       return;
     }
     const banner = existing || document.createElement("div");
     banner.id = "car-watcher-warning";
-    banner.textContent = text;
+    banner.textContent = Array.from(bannerReasons.values()).join(" · ");
     banner.style.cssText =
       "position:fixed;top:0;left:0;right:0;z-index:99999;background:#c0392b;" +
       "color:#fff;font:14px sans-serif;padding:6px;text-align:center;";
     if (!existing) document.body.appendChild(banner);
+  }
+
+  function setBanner(show, text, key) {
+    const k = key || "generic";
+    if (show) bannerReasons.set(k, text);
+    else bannerReasons.delete(k);
+    renderBanner();
   }
 
   // A tab that stops matching a configured search has stopped watching, and
@@ -556,11 +597,22 @@
   let emptyTicks = 0;
   let emptyWarned = false;
 
+  // Seeding must not latch on the first non-empty tick: FB lazy-renders the
+  // grid, so tick 1 routinely sees a partial page. Latching there marked the
+  // rest of that same pre-existing inventory as brand new on tick 2 — the
+  // install-time Telegram flood the seed pass exists to prevent. Hold the
+  // flag until the visible count stops growing (or the cap is hit).
+  const SEED_STABLE_TICKS = 2;
+  const SEED_MAX_TICKS = 15;      // ~5 min at a 20 s tick; then latch anyway
+  let seedPrevCount = -1;
+  let seedStableTicks = 0;
+  let seedTicks = 0;
+
   function warnScraperBlind() {
     if (emptyWarned) return;
     emptyWarned = true;
     console.warn("[car-watcher] no listing anchors found — FB markup changed?");
-    setBanner(true, "car-watcher: no listings found on this page — scraper may be blind");
+    setBanner(true, "car-watcher: no listings found on this page — scraper may be blind", "blind");
     const lastWarn = GM_getValue("empty_warned_at", 0);
     if (Date.now() - lastWarn > WARN_COOLDOWN_MS) {
       GM_setValue("empty_warned_at", Date.now());
@@ -574,7 +626,7 @@
     if (lostWarned) return;
     lostWarned = true;
     console.warn("[car-watcher]", reason);
-    setBanner(true, "car-watcher: " + reason + " — alerts suspended");
+    setBanner(true, "car-watcher: " + reason + " — alerts suspended", "lost");
     const lastWarn = GM_getValue("lost_warned_at", 0);
     if (Date.now() - lastWarn > WARN_COOLDOWN_MS) {
       GM_setValue("lost_warned_at", Date.now());
@@ -590,11 +642,11 @@
     // warn loudly and don't alert.
     const params = new URLSearchParams(location.search);
     if (params.get("sortBy") === "creation_time_descend") {
-      setBanner(false);
+      setBanner(false, null, "sort");
       return true;
     }
     console.warn("[car-watcher] sortBy=creation_time_descend missing from URL");
-    setBanner(true, "car-watcher: this page is NOT sorted by newest — alerts suspended");
+    setBanner(true, "car-watcher: this page is NOT sorted by newest — alerts suspended", "sort");
     const lastWarn = GM_getValue("sort_warned_at", 0);
     if (Date.now() - lastWarn > WARN_COOLDOWN_MS) {
       GM_setValue("sort_warned_at", Date.now());
@@ -664,7 +716,7 @@
       return;
     }
     if (emptyTicks >= EMPTY_TICKS_ALARM) {
-      setBanner(false);
+      setBanner(false, null, "blind");
       console.log("[car-watcher] listings visible again");
     }
     emptyTicks = 0;
@@ -695,9 +747,19 @@
     }
     if (dirty) saveSeen(seenArr);
     if (seeding) {
-      seeded[search.label] = true;
-      GM_setValue("seeded_labels", seeded);
-      console.log("[car-watcher] seeded", search.label, "with", listings.length, "listings");
+      seedTicks += 1;
+      if (listings.length > seedPrevCount) {
+        seedPrevCount = listings.length;   // grid still filling in
+        seedStableTicks = 0;
+      } else {
+        seedStableTicks += 1;
+      }
+      if (seedStableTicks >= SEED_STABLE_TICKS || seedTicks >= SEED_MAX_TICKS) {
+        seeded[search.label] = true;
+        GM_setValue("seeded_labels", seeded);
+        console.log("[car-watcher] seeded", search.label, "with",
+                    listings.length, "listings after", seedTicks, "ticks");
+      }
     }
   }
 
