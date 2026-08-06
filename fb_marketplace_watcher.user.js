@@ -45,6 +45,7 @@
   const SEEN_CAP = 2000;                 // FIFO cap on remembered listing IDs
   const WARN_COOLDOWN_MS = 6 * 3600 * 1000;
   const SEND_SPACING_MS = 1100;          // Telegram allows ~1 msg/s per chat
+  const LOST_SEARCH_RETRY_MS = 10 * 60 * 1000;  // retry a failed rotation landing
 
   // Scraped listings are POSTed to the droplet, which runs the rejection
   // and scoring pipeline and sends any deal alerts itself. Edit the host
@@ -730,11 +731,28 @@
     const search = activeSearch();
     if (!search) {
       // A rotation we initiated must land on a configured search. If it
-      // didn't, FB changed its URL format and the watcher is now blind.
+      // didn't — FB redirected to the marketplace home, a login wall, a
+      // checkpoint, or just changed its URL format — the watcher is now
+      // blind and must recover on its own. onSearchPath() must NOT gate
+      // this: a login/checkpoint/home redirect isn't a search path at all,
+      // and that's exactly the landing that must not go silent — without
+      // this branch firing, no further rotation is ever scheduled and the
+      // tab sits dead until a human notices.
       const expected = GM_getValue("rot_expect", "");
-      if (expected && onSearchPath()) {
+      if (expected) {
         GM_setValue("rot_expect", "");
-        warnLostSearch("rotation into '" + expected + "' landed on an unrecognized search URL");
+        warnLostSearch("rotation into '" + expected + "' landed on " +
+                        (onSearchPath() ? "an unrecognized search URL"
+                                        : "a non-search page (login/checkpoint/redirect?)"));
+        // Retry once after a delay instead of parking here forever: a
+        // transient FB redirect self-heals; a genuine login/checkpoint wall
+        // just keeps re-warning (rate-limited by WARN_COOLDOWN_MS inside
+        // warnLostSearch) until a human logs back in.
+        const idx = GM_getValue("rot_idx", 0);
+        setTimeout(() => {
+          GM_setValue("rot_expect", SEARCH_URLS[idx].label);
+          location.href = SEARCH_URLS[idx].url;
+        }, LOST_SEARCH_RETRY_MS);
       }
       return;
     }

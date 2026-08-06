@@ -485,18 +485,33 @@ def parse_km_text(text):
 def _find_make_span(text, known_makes):
     """Returns (canonical_make, text_after_the_matched_token). The matched
     token may be an alias ('chevy'), so the caller must use the returned
-    after-text — searching for the canonical name would find nothing."""
+    after-text — searching for the canonical name would find nothing.
+
+    Match is chosen by EARLIEST position in the text, not by longest token:
+    picking the longest token anywhere in the text let a make mentioned
+    later ("2014 Ford Escape, will trade for Chevrolet Silverado") beat the
+    vehicle's actual make, filing the listing under the wrong family as a
+    clean comp. Ties at the same position break on longest token then
+    alphabetically, so the result no longer depends on set iteration order
+    (known_makes is a set, whose order is hash-randomized per process).
+    """
     if not text:
         return None, ""
     norm = " %s " % re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9 ]", " ", text.upper()))
     candidates = [(a, c) for a, c in MAKE_ALIASES.items()]
     candidates += [(m, m) for m in known_makes]
-    for token, canon in sorted(candidates, key=lambda t: len(t[0]), reverse=True):
+    best_key = None
+    best_canon, best_after = None, ""
+    for token, canon in candidates:
         needle = " %s " % token.replace("-", " ")
         i = norm.find(needle)
-        if i >= 0:
-            return canon, norm[i + len(needle):]
-    return None, ""
+        if i < 0:
+            continue
+        key = (i, -len(token), token)
+        if best_key is None or key < best_key:
+            best_key, best_canon = key, canon
+            best_after = norm[i + len(needle):]
+    return best_canon, best_after
 
 
 def find_make(text, known_makes):

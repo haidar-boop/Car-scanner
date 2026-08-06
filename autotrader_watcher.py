@@ -68,6 +68,11 @@ SEARCH_URLS = [
 POLL_INTERVAL_BASE_S = 300          # 5 min base ...
 POLL_JITTER_S = 240                 # ... + uniform(0, 240) -> 5-9 min per cycle
 BETWEEN_SEARCHES_S = (2.0, 5.0)     # random pause between the 3 fetches
+# maybe_alert()'s own send can be in flight (up to the 15s HTTP timeout) when
+# notified_at is still NULL — retry_failed_alerts() must not race it. A row
+# only becomes retry-eligible once it's older than this, well past worst case.
+ALERT_RETRY_GRACE_S = 60
+ALERT_RETRY_SPACING_S = 1.0         # match maybe_alert's ~1 msg/s pacing
 FETCH_TIMEOUT_S = 25
 FETCH_RETRIES = 3
 FETCH_BACKOFF_S = 5.0               # doubled per retry
@@ -453,6 +458,13 @@ STEP6_ALERT_COLUMNS = {
 STEP7_LISTING_COLUMNS = {
     "enrich_status": "TEXT",     # 'ok'|'partial'|'failed'|'skipped'|NULL
 }
+# NULL (non-shadow) = fired but never successfully delivered — a Telegram
+# outage at fire time must not lose the alert, so the row is committed
+# regardless and retry_failed_alerts() sweeps anything still NULL. Shadow
+# alerts are never sent, so they stay NULL forever by design.
+STEP8_ALERT_COLUMNS = {
+    "notified_at": "TEXT",
+}
 
 STEP2_DDL = """
 CREATE INDEX IF NOT EXISTS idx_listings_family ON listings(family);
@@ -520,7 +532,8 @@ def migrate_db(conn):
     for table, decls in (("listings", STEP6_LISTING_COLUMNS),
                          ("models", STEP6_MODEL_COLUMNS),
                          ("alerts", STEP6_ALERT_COLUMNS),
-                         ("listings", STEP7_LISTING_COLUMNS)):
+                         ("listings", STEP7_LISTING_COLUMNS),
+                         ("alerts", STEP8_ALERT_COLUMNS)):
         have = {r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)}
         with conn:
             for name, decl in decls.items():
@@ -601,13 +614,23 @@ def migrate_db(conn):
 
 
 def store_listings(conn, rows):
-    """Upsert rows; returns the subset that are brand new (never seen before).
+    """Upsert rows; returns (new_rows, reassess_rows).
+
+    new_rows are never-seen-before listings. reassess_rows are previously
+    stored listings whose price just changed or which just gained
+    enrichment — callers must run these through process_new_rows too (with
+    the same allow_alerts they'd give new_rows from this pass), or a price
+    cut can never score or alert: the UPDATE below wipes z/pct_below/
+    scored_at, but nothing else ever recomputes them. Each reassess row is
+    the fully merged dict (whatever the DB already knew filled in), so
+    downstream scoring sees the same values just written to the row.
 
     Every observed price lands in price_history (including the first), so the
     original asking price survives later in-place updates of listings.price.
     """
     now = utc_now_iso()
     new_rows = []
+    reassess_rows = []
     with conn:
         for r in rows:
             cur = conn.execute(
@@ -690,6 +713,7 @@ def store_listings(conn, rows):
                          merged.get("model"), merged.get("title"),
                          r["source"], r["id"]),
                     )
+                    reassess_rows.append(merged)
                 elif already_enriched and not incoming_enriched:
                     # Bare repost of an enriched row at the same price: keep
                     # the enriched raw_json (it carries the fb_title the
@@ -704,7 +728,7 @@ def store_listings(conn, rows):
                         " WHERE source=? AND id=?",
                         (now, r["raw_json"], r["source"], r["id"]),
                     )
-    return new_rows
+    return new_rows, reassess_rows
 
 
 def meta_get(conn, key):
@@ -1018,9 +1042,76 @@ def maybe_alert(conn, row, score):
         seen_row = conn.execute(
             "SELECT first_seen_at FROM listings WHERE source=? AND id=?",
             (src, lid)).fetchone()
-        telegram_send(format_alert(row, score, predicted, shadow,
-                                   seen_row["first_seen_at"] if seen_row else None))
+        delivered = telegram_send(format_alert(
+            row, score, predicted, shadow,
+            seen_row["first_seen_at"] if seen_row else None))
+        # notified_at stays NULL on failure — the alert row is already
+        # committed above (it must survive a Telegram outage), and
+        # retry_failed_alerts() sweeps anything still NULL every cycle.
+        if delivered:
+            with conn:
+                conn.execute("UPDATE alerts SET notified_at=? WHERE alert_id=?",
+                             (utc_now_iso(), cur.lastrowid))
+        else:
+            log("[alert] #%d %s/%s: telegram send failed, will retry"
+                % (cur.lastrowid, src, lid))
         time.sleep(1.0)
+
+
+def retry_failed_alerts(conn):
+    """Sweep alerts that fired but were never successfully delivered.
+
+    maybe_alert commits an alert row before it knows whether Telegram is
+    reachable, so a network blip must not lose the message: the row stays
+    notified_at=NULL until a send succeeds, and this runs every cycle to
+    retry it. Reconstructed from the stored alert plus a fresh read of the
+    listing (km/url/city/etc aren't duplicated into the alerts table).
+    score.unpriced_features isn't persisted, so a retried message can be
+    missing that one advisory line — every decision-relevant number
+    (price, z, discount, comps) is intact.
+
+    Excludes anything younger than ALERT_RETRY_GRACE_S: maybe_alert's own
+    send can still be in flight (blocking on the HTTP timeout) with
+    notified_at still NULL — sweeping it here too would double-send. And
+    each retry sleeps ALERT_RETRY_SPACING_S like maybe_alert does, so a
+    backlog of several pending alerts doesn't fire in a burst that trips
+    Telegram's per-chat rate limit.
+    """
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(seconds=ALERT_RETRY_GRACE_S)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rows = conn.execute(
+        """SELECT a.alert_id, a.source, a.listing_id, a.z, a.pct_below,
+                  a.price, a.predicted_price, a.model_key, a.comp_count,
+                  a.low_confidence, a.adjustments,
+                  l.km, l.url, l.city, l.seller_type, l.title,
+                  l.year, l.make, l.model, l.first_seen_at
+           FROM alerts a JOIN listings l
+             ON l.source = a.source AND l.id = a.listing_id
+           WHERE a.shadow = 0 AND a.notified_at IS NULL AND a.fired_at <= ?""",
+        (cutoff,)
+    ).fetchall()
+    for r in rows:
+        row = {"km": r["km"], "url": r["url"], "city": r["city"],
+               "seller_type": r["seller_type"], "title": r["title"],
+               "year": r["year"], "make": r["make"], "model": r["model"],
+               "price": r["price"]}
+        score = {"pct_below": r["pct_below"], "z": r["z"],
+                 "model": {"model_key": r["model_key"],
+                           "comp_count": r["comp_count"]},
+                 "low_confidence": bool(r["low_confidence"]),
+                 "adjustments": json.loads(r["adjustments"]) if r["adjustments"] else []}
+        delivered = telegram_send(format_alert(
+            row, score, r["predicted_price"], False, r["first_seen_at"]))
+        if delivered:
+            with conn:
+                conn.execute("UPDATE alerts SET notified_at=? WHERE alert_id=?",
+                             (utc_now_iso(), r["alert_id"]))
+            log("[alert] #%d %s/%s: retry delivered"
+                % (r["alert_id"], r["source"], r["listing_id"]))
+        else:
+            log("[alert] #%d %s/%s: retry still failing"
+                % (r["alert_id"], r["source"], r["listing_id"]))
+        time.sleep(ALERT_RETRY_SPACING_S)
 
 
 def process_new_rows(conn, rows, allow_alerts):
@@ -1116,7 +1207,7 @@ def poll_once(conn):
                 continue
             rows = parse_listings(page_props, label)
             problems = verify_search_state(page_props, url, parsed_count=len(rows))
-            new_rows = store_listings(conn, rows)  # comp data is comp data — always store
+            new_rows, reassess_rows = store_listings(conn, rows)  # comp data is comp data — always store
             record_scan(conn, "autotrader", label, len(rows), len(new_rows))
             # An empty page is streak-tracked (could be a blip); applied-param
             # drift is config-level breakage and warns on the first sighting.
@@ -1141,6 +1232,7 @@ def poll_once(conn):
                 # until the next restart's backfill) — just never alert off a
                 # search that failed verification.
                 process_new_rows(conn, new_rows, allow_alerts=False)
+                process_new_rows(conn, reassess_rows, allow_alerts=False)
                 continue
             parsed_counts[label] = len(rows)
             log("[%s] parsed %d listings (%d new) of %s total"
@@ -1156,6 +1248,7 @@ def poll_once(conn):
             # Seed-pass listings are old inventory: assessed and stored as
             # comps, but never alerted on.
             process_new_rows(conn, new_rows, allow_alerts=not seeding)
+            process_new_rows(conn, reassess_rows, allow_alerts=not seeding)
         except Exception as e:
             # A search that raises every cycle would otherwise never reach
             # record_health below and stay invisible to every alarm.
@@ -1245,10 +1338,14 @@ def send_daily_digest(conn, manual=False):
         by_source[s["source"]] = by_source.get(s["source"], 0) + (s["parsed"] or 0)
 
     alerts = conn.execute(
-        "SELECT shadow, COUNT(*) AS n FROM alerts WHERE fired_at >= ? GROUP BY shadow",
+        "SELECT shadow, notified_at FROM alerts WHERE fired_at >= ?",
         (since,)).fetchall()
-    sent = sum(a["n"] for a in alerts if not a["shadow"])
-    shadowed = sum(a["n"] for a in alerts if a["shadow"])
+    # notified_at distinguishes an actually-delivered alert from one that
+    # fired but is still waiting on retry_failed_alerts() — a Telegram
+    # outage must show up here, not read as "sent" when it wasn't.
+    sent = sum(1 for a in alerts if not a["shadow"] and a["notified_at"])
+    pending = sum(1 for a in alerts if not a["shadow"] and not a["notified_at"])
+    shadowed = sum(1 for a in alerts if a["shadow"])
 
     rejects = conn.execute(
         """SELECT reject_reason, COUNT(*) AS n FROM listings
@@ -1281,7 +1378,8 @@ def send_daily_digest(conn, manual=False):
         lines.append("  " + " · ".join(
             "%s:%s %d" % (tag.get(s["source"], s["source"]), s["search_label"],
                           s["parsed"] or 0) for s in scans))
-    lines.append("Alerts: %d sent · %d shadow" % (sent, shadowed))
+    lines.append("Alerts: %d sent · %d shadow%s" % (
+        sent, shadowed, " · %d pending retry" % pending if pending else ""))
     lines.append("Rejected %d: %s" % (
         sum(by_reason.values()),
         " · ".join("%s %d" % kv for kv in sorted(
@@ -1582,7 +1680,8 @@ def refresh_known(conn):
 
 def run_scheduled_tasks(conn):
     for task in (refresh_known, check_scan_volume, check_fb_silence, maybe_refit,
-                 maybe_daily_digest, maybe_weekly_report, recheck_listings):
+                 maybe_daily_digest, maybe_weekly_report, recheck_listings,
+                 retry_failed_alerts):
         try:
             task(conn)
         except Exception as e:
@@ -1667,10 +1766,11 @@ def handle_ingest_items(conn, items):
             if row is None:
                 skipped += 1
                 continue
-            new_rows = store_listings(conn, [row])
+            new_rows, reassess_rows = store_listings(conn, [row])
             stored += 1
-            if new_rows:
-                process_new_rows(conn, new_rows,
+            to_process = new_rows + reassess_rows
+            if to_process:
+                process_new_rows(conn, to_process,
                                  allow_alerts=not bool(item.get("seed")))
         except Exception as e:
             skipped += 1
@@ -1807,13 +1907,14 @@ def run_test():
                 "OK" if not problems else "PROBLEMS: " + "; ".join(problems)))
 
         all_rows = [r for rows in rows_by_label.values() for r in rows]
-        new_rows = store_listings(conn, all_rows)
+        new_rows, reassess_rows = store_listings(conn, all_rows)
         ids = {(r["source"], r["id"]) for r in all_rows}
         print("  %d listings fetched (%d unique — searches overlap), %d not "
               "already in the database" % (len(all_rows), len(ids), len(new_rows)))
 
         print("\n--- 2. REJECTION BREAKDOWN ---------------------------------------")
         process_new_rows(conn, new_rows, allow_alerts=True)
+        process_new_rows(conn, reassess_rows, allow_alerts=True)
         reasons, clean = {}, 0
         for src, lid in ids:
             row = conn.execute(
