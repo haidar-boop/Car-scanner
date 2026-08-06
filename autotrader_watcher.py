@@ -612,7 +612,8 @@ def store_listings(conn, rows):
         for r in rows:
             cur = conn.execute(
                 "SELECT price, description, km, enrich_status, trim_tier,"
-                " drivetrain FROM listings WHERE source=? AND id=?",
+                " drivetrain, year, make, model, title FROM listings"
+                " WHERE source=? AND id=?",
                 (r["source"], r["id"]),
             )
             existing = cur.fetchone()
@@ -641,22 +642,30 @@ def store_listings(conn, rows):
                 )
                 new_rows.append(r)
             else:
-                if existing[0] != r["price"]:
+                price_changed = existing["price"] != r["price"]
+                incoming_enriched = r.get("enrich_status") in ("ok", "partial")
+                already_enriched = existing["enrich_status"] in ("ok", "partial")
+                if price_changed:
                     conn.execute(
                         "INSERT INTO price_history (source, id, price, seen_at)"
                         " VALUES (?,?,?,?)",
                         (r["source"], r["id"], r["price"], now),
                     )
-                    # A changed price must pass the rejection layer again —
-                    # an edit to $111 would otherwise sit in the comp pool as
-                    # a clean row forever. The stale score is cleared too.
-                    # A bare FB repost (seen-ID eviction, storage reset) must
-                    # not launder away an enrichment-earned verdict: the
-                    # stored description/km/enrich_status survive when the
-                    # incoming row lacks them, and the re-assessment sees the
-                    # merged view — "rebuilt title" stays rejected.
+                if price_changed or (incoming_enriched and not already_enriched):
+                    # Re-assess on a price change (an edit to $111 must not
+                    # sit in the comp pool as clean forever) AND on enrichment
+                    # arriving for a row first seen bare — otherwise a
+                    # rebuilt-title description that shows up on a re-detected
+                    # listing at an unchanged price would never reach the
+                    # blocklist at all.
+                    # The merge runs both ways: incoming values win, stored
+                    # values fill the gaps — so a bare repost can't launder
+                    # away an enrichment-earned verdict, and late enrichment
+                    # can't leave year/make/model as NULL zombies that pass
+                    # assess but are invisible to COMP_SQL.
                     merged = dict(r)
-                    for col in ("description", "km", "trim_tier", "drivetrain"):
+                    for col in ("description", "km", "trim_tier", "drivetrain",
+                                "year", "make", "model", "title"):
                         if merged.get(col) is None:
                             merged[col] = existing[col]
                     keep_status = existing["enrich_status"]
@@ -670,13 +679,24 @@ def store_listings(conn, rows):
                         " family=?, fingerprint=?, reject_reason=?,"
                         " trim_tier=?, drivetrain=?, model_version=?,"
                         " description=?, km=?, enrich_status=?,"
+                        " year=?, make=?, model=?, title=?,"
                         " z=NULL, pct_below=NULL, scored_at=NULL"
                         " WHERE source=? AND id=?",
                         (now, r["price"], r["raw_json"], family, fp, reason,
                          merged.get("trim_tier"), merged.get("drivetrain"),
                          merged.get("model_version"), merged.get("description"),
                          merged.get("km"), keep_status,
+                         merged.get("year"), merged.get("make"),
+                         merged.get("model"), merged.get("title"),
                          r["source"], r["id"]),
+                    )
+                elif already_enriched and not incoming_enriched:
+                    # Bare repost of an enriched row at the same price: keep
+                    # the enriched raw_json (it carries the fb_title the
+                    # lexicon backfill re-extracts from).
+                    conn.execute(
+                        "UPDATE listings SET last_seen_at=? WHERE source=? AND id=?",
+                        (now, r["source"], r["id"]),
                     )
                 else:
                     conn.execute(

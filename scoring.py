@@ -578,9 +578,16 @@ def parse_fb_listing(item, known, now_iso):
         except (TypeError, ValueError):
             val = None
         if val and val > 0:
-            if str(odo.get("unit") or "").upper().startswith("MILE"):
+            # Only units we positively recognize are trusted. An unknown
+            # spelling must NOT default to km: a 120,000-mile reading stored
+            # as 120,000 km silently understates mileage by 40% and fires
+            # fake deals — the one enrichment failure that corrupts scoring
+            # instead of failing safe. Unknown unit -> ignore the structured
+            # odo and fall back to text parsing.
+            unit = str(odo.get("unit") or "").strip().upper()
+            if unit.startswith("MILE") or unit == "MI":
                 km, miles = int(val * MILES_TO_KM), val
-            else:
+            elif unit.startswith("KILOMET") or unit in ("KM", "KMS"):
                 km = val
     if km is None:
         # fb_title is the cleaner identity source but usually omits the km
@@ -1085,6 +1092,14 @@ def _selftest():
                            known, "2026-08-05T00:00:00Z")
     check("odo miles converted", row["km"] == 193_120
           and row["km_converted_from_miles"] == 120_000)
+    row = parse_fb_listing(dict(base_item, odo={"unit": "MI", "value": 120000}),
+                           known, "2026-08-05T00:00:00Z")
+    check("odo MI converted", row["km"] == 193_120)
+    # an unknown unit must never be trusted as km — fall back to text
+    row = parse_fb_listing(dict(base_item, text="2014 Ford F-150 XLT 185,000 km",
+                                odo={"unit": "FURLONGS", "value": 120000}),
+                           known, "2026-08-05T00:00:00Z")
+    check("odo unknown unit distrusted", row["km"] == 185_000)
     # structured odo equal to price survives; text-parsed echo still dies
     row = parse_fb_listing(dict(base_item, price_text="$15,000",
                                 odo={"unit": "KILOMETERS", "value": 15000}),
