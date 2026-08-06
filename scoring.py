@@ -18,6 +18,7 @@ caller passes in. `python3 scoring.py` runs a selftest.
 import json
 import math
 import re
+import unicodedata
 import zlib
 from datetime import datetime, timedelta, timezone
 
@@ -71,6 +72,16 @@ REFIT_NEW_COMP_THRESHOLD = 200
 
 # --- SCORING / GATES --------------------------------------------------------
 
+# --- TRIM / DRIVETRAIN OFFSETS ----------------------------------------------
+
+TRIM_LEXICON_VERSION = 1     # bump after editing the lexicon below: migrate_db
+                             # re-extracts every stored row on the next start
+MIN_OFFSET_COMPS = 5         # comps sharing a level before an offset exists
+OFFSET_SHRINK_K = 5.0        # offset = median_residual * n / (n + K)
+OFFSET_CLAMP = 0.30          # log-space cap (~±35%); a contaminated thin
+                             # group must not swing predictions absurdly
+TRIM_TIER_NAMES = {0: "base trim", 1: "mid trim", 2: "premium trim"}
+
 MAD_SCALE = 1.4826           # makes MAD comparable to a normal sigma
 Z_ALERT = {"autotrader": -2.0, "facebook": -2.0}
 Z_ALERT_DEALER = -2.5        # dealer pricing is market-calibrated; demand more
@@ -106,6 +117,67 @@ MAKE_ALIASES = {
 FAMILY_MERGES = {
     "NISSAN:QASHQAI": "NISSAN:ROGUE",
 }
+
+# --- trim / drivetrain lexicon ----------------------------------------------
+# Tiers are BUCKETS, not enforced ordinals: offsets are learned per
+# (family, tier), so what matters is that a token lands in the same bucket
+# consistently within a family — an arguably-off-by-one label still gets the
+# right learned offset. When you edit anything below, bump
+# TRIM_LEXICON_VERSION so the migration re-classifies stored rows.
+
+# Drivetrain is a binary "all driven wheels" vs "two driven wheels" flag;
+# RWD folds into 'fwd' deliberately (within BMW:3SERIES the two-wheel group
+# IS the RWD cars, and offsets are per-family, so only consistency matters).
+AWD_TOKENS = ["4X4", "4WD", "AWD", "4MOTION", "QUATTRO", "4MATIC", "AWC",
+              "SH AWD", "ALL WHEEL DRIVE"]
+FWD_TOKENS = ["FWD", "2WD", "RWD", "4X2", "FRONT WHEEL DRIVE",
+              "REAR WHEEL DRIVE"]
+# Prefix-match tokens: BMW writes "xDrive28i" as one word, so a word-bounded
+# XDRIVE never matches.
+AWD_PREFIXES = ["XDRIVE"]
+FWD_PREFIXES = ["SDRIVE"]
+
+TRIM_TIERS_GLOBAL = {
+    2: ["PLATINUM", "KING RANCH", "LARIAT", "LARAMIE", "LONGHORN", "DENALI",
+        "HIGH COUNTRY", "LTZ", "SLT", "AT4", "REBEL", "RAPTOR", "TRX",
+        "LIMITED", "ULTIMATE", "LUXURY", "CALLIGRAPHY", "AVENIR", "SUMMIT",
+        "OVERLAND", "TRAILHAWK", "RUBICON", "SAHARA", "TOURING", "EX L",
+        "XLE", "XSE", "TRD PRO", "PRO 4X", "TITANIUM", "F SPORT", "TYPE R",
+        "TYPE S", "PREMIER", "HIGHLINE", "EXECLINE", "SIGNATURE",
+        "GRAND TOURING", "OUTER BANKS", "BADLANDS", "KING CAB PRO"],
+    1: ["XLT", "LT", "SV", "SE", "SEL", "SLE", "EX", "LE", "SPORT",
+        "BIG HORN", "BIGHORN", "TRAIL BOSS", "PREFERRED", "COMFORTLINE",
+        "ELEVATION", "TRD", "GT LINE", "ALTITUDE", "LATITUDE", "SR5",
+        "VALUE PACKAGE"],
+    0: ["XL", "LS", "LX", "DX", "CE", "BASE", "WORK TRUCK", "TRADESMAN",
+        "ESSENTIAL", "TRENDLINE", "CONVENIENCE", "SXT", "STX", "LAREDO"],
+}
+# Same-token conflicts across makes get scoped entries; scoped beats global.
+TRIM_TIERS_BY_MAKE = {
+    "JEEP":       {"SPORT": 0},               # Wrangler/GC Sport is the base trim
+    "RAM":        {"ST": 0},
+    "DODGE":      {"ST": 0},
+    "FORD":       {"ST": 2, "GT": 2},         # Explorer ST / Mustang GT
+    "MAZDA":      {"GX": 0, "GS": 1, "GT": 2},  # Canadian Mazda ladder
+    "TOYOTA":     {"SR": 0},                  # Tacoma/Tundra SR is base
+    "NISSAN":     {"S": 0, "SL": 2},          # bare "S" only safe when scoped
+    "SUBARU":     {"TOURING": 1},             # 2nd-from-base in Canada
+    "CHEVROLET":  {"WT": 0},
+    "GMC":        {"WT": 0},
+    "KIA":        {"SX": 2},
+}
+# Phrases blanked out before trim scanning — feature prose that contains trim
+# tokens ("limited slip diff" is not a Limited; "premier propriétaire" is
+# French for first owner, not a Buick Premier).
+TRIM_IGNORE = ["LIMITED SLIP", "LIMITED WARRANTY", "LIMITED TIME",
+               "SPORT MODE", "SPORT PACKAGE", "SPORT PKG",
+               "SPORT APPEARANCE", "SPORT WHEELS", "LS SWAP",
+               "EX FLEET", "EX LEASE", "EX RENTAL", "EX DEMO",
+               "PREMIER PROPRIETAIRE", "PREMIERE PROPRIETAIRE",
+               "LE PLUS", "SPORT UTILITY"]
+# Deliberately excluded: bare "S" (only Nissan-scoped — hits everywhere),
+# bare "L", "PREMIUM" ("premium audio" is universal), "CUSTOM" ("custom
+# exhaust" in FB text). Add them scoped if a family needs them.
 
 # search_label -> segment model key (FB labels fold into AutoTrader segments).
 SEGMENT_MAP = {
@@ -173,6 +245,121 @@ def family_from_raw(raw_json, make, model):
         except (ValueError, AttributeError):
             pass
     return normalize_family(make, group or model)
+
+
+# --- trim / drivetrain extraction -------------------------------------------
+
+def _translit(s):
+    """Fold accents to base letters ("sécurité"→"securite") — stripping them
+    to spaces would leave stray single-letter tokens that misfire as trims."""
+    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+
+
+def _norm_trim_text(s):
+    """Uppercase, transliterate, collapse every non-alphanumeric run to one
+    space, pad ends — "King-Ranch"→" KING RANCH "."""
+    if not s or not isinstance(s, str):
+        return ""
+    return " %s " % re.sub(r"[^A-Z0-9]+", " ", _translit(s).upper()).strip()
+
+
+def parse_drivetrain(*texts):
+    """'awd' | 'fwd' | None from any of the given texts (Nones skipped).
+
+    Word-bounded token scan; XDRIVE/SDRIVE match as prefixes because BMW
+    writes "xDrive28i" as one word. Conflicting evidence -> None: never
+    guess, an unadjusted prediction is safer than a wrong one.
+    """
+    norm = _norm_trim_text(" ".join(str(t) for t in texts if t))
+    if not norm.strip():
+        return None
+    awd = any(" %s " % t in norm for t in AWD_TOKENS) or \
+        any(re.search(r"\b%s" % p, norm) for p in AWD_PREFIXES)
+    fwd = any(" %s " % t in norm for t in FWD_TOKENS) or \
+        any(re.search(r"\b%s" % p, norm) for p in FWD_PREFIXES)
+    if awd and fwd:
+        return None
+    return "awd" if awd else "fwd" if fwd else None
+
+
+def parse_trim_tier(make, *texts, exclude_tokens=()):
+    """0 | 1 | 2 | None. make = canonical make ('FORD') or None.
+
+    Precision rules, each earned by a real failure mode:
+    - Accents transliterate ("sécurité"→SECURITE), so French text never
+      fragments into stray one-letter tokens.
+    - TRIM_IGNORE word-sequences are blanked first ("limited slip",
+      "ex-fleet", "premier propriétaire").
+    - Tokens of <=2 letters (LE/CE/SE/XL/LT/EX/...) only match where the
+      ORIGINAL text has them fully uppercase — sellers write trims as "XL"
+      but French articles as "le"/"Le", which is what keeps bilingual
+      Alberta listings from being tiered by their prose.
+    - All candidates are collected, long (>=3 char or multiword) matches
+      beat short ones, and if only short matches remain and they disagree
+      on tier, the answer is None — ambiguity never resolves by list order.
+    - exclude_tokens suppresses the listing's own model name (a Lexus LS
+      is not an LS trim).
+    """
+    raw = " ".join(str(t) for t in texts if t)
+    if not raw.strip():
+        return None
+    cased = re.sub(r"[^A-Za-z0-9]+", " ", _translit(raw)).split()
+    upper = [t.upper() for t in cased]
+    blanked = [False] * len(upper)
+    for phrase in TRIM_IGNORE:
+        words = phrase.split()
+        for i in range(len(upper) - len(words) + 1):
+            if upper[i:i + len(words)] == words:
+                for j in range(i, i + len(words)):
+                    blanked[j] = True
+
+    scoped = TRIM_TIERS_BY_MAKE.get(make or "", {})
+    candidates = [(tok, tier) for tok, tier in scoped.items()]
+    shadowed = set(scoped)
+    for tier, toks in TRIM_TIERS_GLOBAL.items():
+        candidates.extend((tok, tier) for tok in toks if tok not in shadowed)
+    excluded = {str(t).upper() for t in exclude_tokens}
+
+    long_hits, short_hits = [], []
+    for tok, tier in candidates:
+        if tok in excluded:
+            continue
+        words = tok.split()
+        for i in range(len(upper) - len(words) + 1):
+            if upper[i:i + len(words)] != words or any(blanked[i:i + len(words)]):
+                continue
+            if len(tok) <= 2 and not cased[i].isupper():
+                continue  # "le camion" is not an LE
+            (long_hits if (len(words) > 1 or len(tok) >= 3)
+             else short_hits).append((tok, tier))
+            break
+    if long_hits:
+        long_hits.sort(key=lambda t: len(t[0]), reverse=True)
+        return long_hits[0][1]
+    tiers = {tier for _, tier in short_hits}
+    if len(tiers) == 1:
+        return tiers.pop()
+    return None  # nothing found, or short tokens disagree — never guess
+
+
+def extract_features(make_raw, model_version, title, description,
+                     exclude_tokens=()):
+    """(trim_tier, drivetrain) — the single entry point shared by the
+    AutoTrader parser, the FB parser, and the migration backfill.
+
+    Trim scans modelVersionInput, else the title (FB has nothing else) —
+    NEVER the description: dealer prose is full of "limited warranty" and
+    "sport mode". Callers whose title is a synthesized "year make model"
+    (AutoTrader) must pass title=None: such a title can only ever match
+    model-name tokens, which is pure noise. Drivetrain scans everything;
+    "4x4"/"quattro" are rarely metaphorical.
+    """
+    make = normalize_make(make_raw)
+    mv = str(model_version) if model_version is not None else None
+    tier = parse_trim_tier(make, mv, exclude_tokens=exclude_tokens) if mv \
+        else parse_trim_tier(make, title, exclude_tokens=exclude_tokens)
+    drivetrain = parse_drivetrain(mv, title, description)
+    return tier, drivetrain
 
 
 # --- rejection layer --------------------------------------------------------
@@ -367,6 +554,10 @@ def parse_fb_listing(item, known, now_iso):
         km, miles = None, None  # almost certainly the price echoed as mileage
     make, after = _find_make_span(text, known["makes"])
     modelkey = find_model(after, known["models_by_make"].get(make)) if make else None
+    # The listing's own model name must not be read as a trim ("Lexus LS").
+    trim_tier, drivetrain = extract_features(
+        make, None, text, None,
+        exclude_tokens=(modelkey,) if modelkey else ())
     return {
         "id": listing_id,
         "source": "facebook",
@@ -386,6 +577,9 @@ def parse_fb_listing(item, known, now_iso):
         "price_label": None,
         "search_label": str(item.get("label") or "facebook")[:40],
         "km_converted_from_miles": miles,
+        "trim_tier": trim_tier,
+        "drivetrain": drivetrain,
+        "model_version": None,
         "raw_json": json.dumps({
             "text": text, "price_text": str(item.get("price_text") or "")[:40],
             "seen_at": str(item.get("seen_at") or now_iso)[:32],
@@ -454,11 +648,88 @@ def predict_log_price(model_row, age, km):
     return model_row["b0"] + model_row["b1"] * age + model_row["b2"] * math.log(km + 1)
 
 
-def robust_z(price, model_row, age, km):
-    """Returns (z, pct_below_predicted). Negative z = below the curve."""
-    residual = math.log(price) - predict_log_price(model_row, age, km)
-    mad = max(model_row["mad"], 1e-9)
-    z = residual / (MAD_SCALE * mad)
+def compute_offsets(residuals, labels):
+    """{label: {'off': float, 'n': int}} — shrunk, clamped median residual
+    per label. Labels may contain None (those comps are skipped). Groups
+    below MIN_OFFSET_COMPS get no offset at all: silence over guessing."""
+    residuals = np.asarray(residuals, dtype=float)
+    out = {}
+    for label in {l for l in labels if l is not None}:
+        mask = np.array([l == label for l in labels])
+        n = int(mask.sum())
+        if n < MIN_OFFSET_COMPS:
+            continue
+        med = float(np.median(residuals[mask]))
+        off = med * n / (n + OFFSET_SHRINK_K)
+        off = max(-OFFSET_CLAMP, min(OFFSET_CLAMP, off))
+        out[label] = {"off": off, "n": n}
+    return out
+
+
+def unpack_offsets(offsets_json):
+    """JSON text/None -> {'trim': {int_tier: {...}}, 'drivetrain': {...}}.
+    Tolerant of NULL/''/'{}'; JSON stringifies int keys, so restore them."""
+    if not offsets_json:
+        return {}
+    try:
+        raw = json.loads(offsets_json)
+    except (ValueError, TypeError):
+        return {}
+    out = {}
+    for feature, levels in (raw or {}).items():
+        if not isinstance(levels, dict):
+            continue
+        fixed = {}
+        for k, v in levels.items():
+            key = int(k) if feature == "trim" and str(k).lstrip("-").isdigit() else k
+            fixed[key] = v
+        if fixed:
+            out[feature] = fixed
+    return out
+
+
+def applicable_offsets(model_row, trim_tier, drivetrain):
+    """[('trim', 2, +0.087), ('drivetrain', 'awd', +0.055)] — empty when the
+    listing's features are unknown or the model has no matching level.
+    Unknown never becomes a penalty."""
+    offsets = model_row.get("offsets") or {}
+    out = []
+    if trim_tier is not None and trim_tier in (offsets.get("trim") or {}):
+        out.append(("trim", trim_tier, offsets["trim"][trim_tier]["off"]))
+    if drivetrain and drivetrain in (offsets.get("drivetrain") or {}):
+        out.append(("drivetrain", drivetrain,
+                    offsets["drivetrain"][drivetrain]["off"]))
+    return out
+
+
+def robust_z(price, model_row, age, km, trim_tier=None, drivetrain=None):
+    """Returns (z, pct_below_predicted). Negative z = below the curve.
+
+    When the listing's trim/drivetrain is known and the model carries a
+    matching offset, the prediction is adjusted and z divides by mad_adj
+    (the spread after offsets explained their variance). Otherwise the raw
+    mad is used — an unknown-trim listing scores exactly as it would on a
+    model with no offsets at all, which is what keeps this change strictly
+    no-worse for the rows we know least about.
+    """
+    adjustments = applicable_offsets(model_row, trim_tier, drivetrain)
+    delta = sum(a[2] for a in adjustments)
+    residual = math.log(price) - (predict_log_price(model_row, age, km) + delta)
+    mad = model_row["mad"]
+    # mad_adj is measured after ALL offset features were adjusted, so it is
+    # the right denominator only when this listing got all of them — a
+    # trim-unknown listing still carries full between-trim variance in its
+    # residual and must divide by the raw mad. And the floor: offsets can
+    # legitimately explain most of a family's spread (dealer fleets cluster
+    # tightly within a trim), but a divisor below MAD_MIN would mint huge z
+    # from a few percent of noise — the same degeneracy the raw-mad gate
+    # exists to block.
+    offset_features = {f for f, levels in (model_row.get("offsets") or {}).items()
+                       if levels}
+    applied_features = {a[0] for a in adjustments}
+    if adjustments and model_row.get("mad_adj") and applied_features >= offset_features:
+        mad = max(model_row["mad_adj"], MAD_MIN)
+    z = residual / (MAD_SCALE * max(mad, 1e-9))
     pct_below = (1.0 - math.exp(residual)) * 100.0
     return z, pct_below
 
@@ -498,7 +769,7 @@ def gate(model_row, age, km, now_iso, kind):
 # rejection layer never ran on has reject_reason NULL *and* family NULL, and
 # must not slip into segment fits as a "clean" comp.
 COMP_SQL = """
-SELECT year, km, price, first_seen_at FROM listings
+SELECT year, km, price, first_seen_at, trim_tier, drivetrain FROM listings
 WHERE {where} AND reject_reason IS NULL AND family IS NOT NULL
   AND COALESCE(is_damaged, 0) = 0
   AND year IS NOT NULL AND km IS NOT NULL AND price IS NOT NULL
@@ -506,17 +777,44 @@ WHERE {where} AND reject_reason IS NULL AND family IS NOT NULL
 """
 
 
-def _fit_and_pack(comps, seed):
-    ages = np.array([age_of(y, seen) for (y, _, _, seen) in comps])
-    kms = np.array([float(k) for (_, k, _, _) in comps])
-    prices = np.array([float(p) for (_, _, p, _) in comps])
+def _fit_and_pack(comps, seed, with_offsets=True):
+    ages = np.array([age_of(c[0], c[3]) for c in comps])
+    kms = np.array([float(c[1]) for c in comps])
+    prices = np.array([float(c[2]) for c in comps])
     fit = fit_robust(ages, np.log(kms + 1), np.log(prices), seed)
     if fit is None:
         return None
     fit.update({
         "km_min": int(kms.min()), "km_max": int(kms.max()),
         "age_min": float(ages.min()), "age_max": float(ages.max()),
+        "offsets": {}, "mad_adj": None,
     })
+    if not with_offsets:
+        return fit
+    # Post-fit residual offsets, sequentially residualized: trim first (the
+    # larger effect), then drivetrain on the trim-adjusted residuals — so
+    # applying both at score time never double-counts their shared variance
+    # (Platinums are mostly 4x4).
+    tiers = [c[4] for c in comps]
+    drivetrains = [c[5] for c in comps]
+    resid = np.log(prices) - (fit["b0"] + fit["b1"] * ages
+                              + fit["b2"] * np.log(kms + 1))
+    trim_offs = compute_offsets(resid, tiers)
+    applied = np.array([trim_offs[t]["off"] if t in trim_offs else 0.0
+                        for t in tiers])
+    resid2 = resid - applied
+    dt_offs = compute_offsets(resid2, drivetrains)
+    applied2 = np.array([dt_offs[d]["off"] if d in dt_offs else 0.0
+                         for d in drivetrains])
+    resid3 = resid2 - applied2
+    offsets = {}
+    if trim_offs:
+        offsets["trim"] = trim_offs
+    if dt_offs:
+        offsets["drivetrain"] = dt_offs
+    if offsets:
+        fit["offsets"] = offsets
+        fit["mad_adj"] = float(np.median(np.abs(resid3)))
     return fit
 
 
@@ -549,7 +847,11 @@ def refit_models(conn, now_iso):
             (*labels, cutoff)).fetchall()
         if len(comps) < MIN_COMPS_GATE:
             continue
-        fit = _fit_and_pack(comps, zlib.crc32(segment.encode()) & 0xFFFFFFFF)
+        # No offsets on segment models: a tier's median residual there
+        # confounds trim with family mix (base trims of expensive families
+        # vs premium trims of cheap ones).
+        fit = _fit_and_pack(comps, zlib.crc32(segment.encode()) & 0xFFFFFFFF,
+                            with_offsets=False)
         if fit:
             _upsert_model(conn, "segment:%s" % segment, "segment", fit, now_iso)
             written += 1
@@ -560,17 +862,20 @@ def _upsert_model(conn, model_key, kind, fit, now_iso):
     with conn:
         conn.execute(
             """INSERT INTO models (model_key, kind, b0, b1, b2, mad, comp_count,
-                                   km_min, km_max, age_min, age_max, method, fitted_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                   km_min, km_max, age_min, age_max, method,
+                                   fitted_at, offsets_json, mad_adj)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(model_key) DO UPDATE SET
                  kind=excluded.kind, b0=excluded.b0, b1=excluded.b1,
                  b2=excluded.b2, mad=excluded.mad, comp_count=excluded.comp_count,
                  km_min=excluded.km_min, km_max=excluded.km_max,
                  age_min=excluded.age_min, age_max=excluded.age_max,
-                 method=excluded.method, fitted_at=excluded.fitted_at""",
+                 method=excluded.method, fitted_at=excluded.fitted_at,
+                 offsets_json=excluded.offsets_json, mad_adj=excluded.mad_adj""",
             (model_key, kind, fit["b0"], fit["b1"], fit["b2"], fit["mad"],
              fit["n"], fit["km_min"], fit["km_max"], fit["age_min"],
-             fit["age_max"], fit["method"], now_iso),
+             fit["age_max"], fit["method"], now_iso,
+             json.dumps(fit.get("offsets") or {}), fit.get("mad_adj")),
         )
 
 
@@ -695,6 +1000,134 @@ def _selftest():
          "text": "2012 Ford F-150 15k low kms great truck", "label": "trucks_5k_30k"},
         known, "2026-08-05T00:00:00Z")
     check("price-echo km dropped", row["km"] is None)
+
+    # trim / drivetrain extraction
+    check("4x4 -> awd", parse_drivetrain("4x4 SV") == "awd")
+    check("FWD -> fwd", parse_drivetrain("FWD 4dr V6 Auto LX") == "fwd")
+    check("xDrive28i -> awd", parse_drivetrain("X3 xDrive28i") == "awd")
+    check("quattro -> awd", parse_drivetrain("Quattro Technik") == "awd")
+    check("conflict -> None", parse_drivetrain("FWD model, also has 4x4 badge") is None)
+    check("4Runner not 4x4", parse_drivetrain("2014 Toyota 4Runner") is None)
+    check("projector -> None", parse_drivetrain("projector headlights") is None)
+
+    check("XLT tier 1", parse_trim_tier("FORD", "4x4 XLT") == 1)
+    check("Platinum tier 2", parse_trim_tier("FORD", "Platinum") == 2)
+    check("no trim -> None", parse_trim_tier("FORD", "projector headlights") is None)
+    check("SV tier 1", parse_trim_tier("NISSAN", "4x4 SV") == 1)
+    check("Nissan bare S", parse_trim_tier("NISSAN", "AWD S 4dr") == 0)
+    check("Ford bare S -> None", parse_trim_tier("FORD", "AWD S 4dr") is None)
+    check("SEL beats SE", parse_trim_tier("FORD", "SEL AWD") == 1)
+    check("LTZ beats LT", parse_trim_tier("CHEVROLET", "LTZ Z71") == 2)
+    check("TRD PRO beats TRD", parse_trim_tier("TOYOTA", "TRD PRO 4x4") == 2)
+    check("ignore LIMITED SLIP", parse_trim_tier("FORD", "XL limited slip diff") == 0)
+    check("Subaru Touring mid", parse_trim_tier("SUBARU", "Touring") == 1)
+    check("Honda Touring premium", parse_trim_tier("HONDA", "Touring") == 2)
+    check("Jeep Sport base", parse_trim_tier("JEEP", "Sport") == 0)
+    check("Honda Sport mid", parse_trim_tier("HONDA", "Sport") == 1)
+    check("dealer garbage", parse_trim_tier("CHEVROLET", "LT  - $199.79 /Wk") == 1)
+    # bilingual Alberta prose must not tier a listing (short tokens need to
+    # be uppercase in the original text)
+    check("french le not LE", parse_trim_tier("FORD", "F-150 XL le camion est propre") == 0)
+    check("french ce not CE", parse_trim_tier("TOYOTA", "ce char est propre 120k") is None)
+    check("french se not SE", parse_trim_tier("TOYOTA", "Corolla se vend vite") is None)
+    check("premier proprietaire", parse_trim_tier("CHEVROLET",
+          "Cruze premier propriétaire") is None)
+    check("accents no stray S", parse_trim_tier("NISSAN",
+          "Rogue avec inspection de sécurité") is None)
+    check("ex-fleet not EX", parse_trim_tier("FORD", "2018 F-150 XL ex-fleet truck") == 0)
+    check("EX-LEASE caps blanked", parse_trim_tier("FORD", "F-150 XL EX-LEASE") == 0)
+    check("real Honda EX caps", parse_trim_tier("HONDA", "Civic EX 4dr") == 1)
+    check("lowercase xl rejected", parse_trim_tier("FORD", "f-150 xl clean") is None)
+    check("short conflict -> None", parse_trim_tier("FORD", "XL or LT trades?") is None)
+    check("model-name shield", parse_trim_tier("LEXUS", "2013 Lexus LS 460",
+                                               exclude_tokens=("LS",)) is None)
+    tier, dt = extract_features("Ford", "4x4 XLT", "2015 Ford F-150", "clean truck")
+    check("extract_features", tier == 1 and dt == "awd")
+    check("non-string mv survives", extract_features("Ford", 1500, None, None)
+          == (None, None))
+    # trim never scans the description ("limited warranty" prose)
+    tier, _ = extract_features("Ford", "XL", "2015 Ford F-150",
+                               "limited warranty included")
+    check("description not trim-scanned", tier == 0)
+    row = parse_fb_listing(
+        {"id": "123456781", "price_text": "CA$9,500",
+         "text": "2014 Ford F-150 XLT 4x4 185,000 km", "label": "trucks_5k_30k"},
+        known, "2026-08-05T00:00:00Z")
+    check("fb trim+drive", row["trim_tier"] == 1 and row["drivetrain"] == "awd")
+
+    # offset math
+    offs = compute_offsets(np.array([0.10] * 5 + [0.0] * 20),
+                           [2] * 5 + [None] * 20)
+    check("shrinkage n=5", abs(offs[2]["off"] - 0.05) < 1e-9)
+    offs = compute_offsets(np.array([0.10] * 45), [2] * 45)
+    check("shrinkage n=45", abs(offs[2]["off"] - 0.09) < 1e-9)
+    check("n=4 absent", compute_offsets(np.array([0.1] * 4), [2] * 4) == {})
+    offs = compute_offsets(np.array([1.0] * 100), [0] * 100)
+    check("clamp", offs[0]["off"] == OFFSET_CLAMP)
+    check("unpack tolerant", unpack_offsets(None) == {} and unpack_offsets("") == {}
+          and unpack_offsets("{}") == {} and unpack_offsets("not json") == {})
+    packed = json.dumps({"trim": {"2": {"off": 0.08, "n": 9}},
+                         "drivetrain": {"awd": {"off": 0.05, "n": 12}}})
+    up = unpack_offsets(packed)
+    check("unpack int keys", 2 in up["trim"] and up["drivetrain"]["awd"]["n"] == 12)
+
+    # sequential residualization: all tier-2 comps are awd, tier-0 are 2wd ->
+    # after trim adjustment the drivetrain offsets must be ~0 (no double count)
+    rng2 = np.random.default_rng(11)
+    n2 = 60
+    ages2 = rng2.uniform(2, 12, n2)
+    kms2 = rng2.uniform(50_000, 250_000, n2)
+    tiers2 = [2] * 20 + [0] * 20 + [None] * 20
+    dts2 = ["awd"] * 20 + ["fwd"] * 20 + [None] * 20
+    base_log = 10.4 - 0.08 * ages2 - 0.32 * np.log(kms2 + 1)
+    tier_fx = np.array([0.22 if t == 2 else -0.16 if t == 0 else 0.0 for t in tiers2])
+    prices2 = np.exp(base_log + tier_fx + rng2.normal(0, 0.06, n2))
+    comps2 = [(int(2026 - a), int(k), int(p), "2026-08-05T00:00:00Z", t, d)
+              for a, k, p, t, d in zip(ages2, kms2, prices2, tiers2, dts2)]
+    packed_fit = _fit_and_pack(comps2, seed=3)
+    check("trim offsets learned", 2 in packed_fit["offsets"]["trim"]
+          and 0 in packed_fit["offsets"]["trim"])
+    check("tier2 positive", packed_fit["offsets"]["trim"][2]["off"] > 0.05)
+    check("tier0 negative", packed_fit["offsets"]["trim"][0]["off"] < -0.05)
+    dt_offs = packed_fit["offsets"].get("drivetrain", {})
+    residual_dt = max((abs(v["off"]) for v in dt_offs.values()), default=0.0)
+    check("no drivetrain double-count", residual_dt < 0.04)
+    check("mad_adj < mad", packed_fit["mad_adj"] < packed_fit["mad"])
+
+    # end-to-end: offsets change verdicts the right way, unknowns unchanged
+    m2 = dict(packed_fit, comp_count=n2, fitted_at="2026-08-05T00:00:00Z",
+              model_key="family:TEST:CAR", kind="family")
+    dt0 = "fwd" if "fwd" in m2["offsets"].get("drivetrain", {}) else None
+    fair0 = math.exp(predict_log_price(m2, 8.0, 150_000)
+                     + m2["offsets"]["trim"][0]["off"]
+                     + (m2["offsets"]["drivetrain"][dt0]["off"] if dt0 else 0))
+    deal_price = int(fair0 * 0.70)
+    z0, _ = robust_z(deal_price, m2, 8.0, 150_000, trim_tier=0, drivetrain=dt0)
+    z2, _ = robust_z(deal_price, m2, 8.0, 150_000, trim_tier=2, drivetrain="awd")
+    check("tier0 deal alerts", z0 < -2.0)
+    check("same price on tier2 much deeper", z2 < z0 - 1.0)
+    m2_plain = dict(m2, offsets={}, mad_adj=None)
+    zu, pu = robust_z(deal_price, m2, 8.0, 150_000)          # unknown features
+    zp, pp = robust_z(deal_price, m2_plain, 8.0, 150_000)    # no-offset model
+    check("unknown tier strictly unchanged", zu == zp and pu == pp)
+    # only ONE of two offset features known -> residual keeps the other
+    # feature's variance, so the divisor must stay the RAW mad
+    if dt0 and m2["mad_adj"] < m2["mad"]:
+        z_partial, _ = robust_z(deal_price, m2, 8.0, 150_000, trim_tier=0)
+        expected = (math.log(deal_price)
+                    - (predict_log_price(m2, 8.0, 150_000)
+                       + m2["offsets"]["trim"][0]["off"])) / (MAD_SCALE * m2["mad"])
+        check("partial features use raw mad", abs(z_partial - expected) < 1e-9)
+    # a degenerate mad_adj is floored at MAD_MIN, never divides raw noise
+    m_degen = dict(m2, mad_adj=0.001)
+    z_floor, _ = robust_z(deal_price, m_degen, 8.0, 150_000,
+                          trim_tier=0, drivetrain=dt0)
+    delta_all = (m2["offsets"]["trim"][0]["off"]
+                 + (m2["offsets"]["drivetrain"][dt0]["off"] if dt0 else 0))
+    expect_floor = (math.log(deal_price)
+                    - (predict_log_price(m2, 8.0, 150_000) + delta_all)) \
+        / (MAD_SCALE * MAD_MIN)
+    check("mad_adj floored at MAD_MIN", abs(z_floor - expect_floor) < 1e-9)
 
     # robust fit on contaminated synthetic comps
     rng = np.random.default_rng(42)

@@ -41,6 +41,28 @@ correction: listings that vanish within ~48 h very likely sold fast.
    family's residuals. Alerts fire at `z ≤ −2.0` (per source), dealers at
    `z ≤ −2.5` (their pricing is already market-calibrated). Alerts report both
    z and percent-below-predicted.
+
+   **Trim & drivetrain offsets.** A base XL 2WD and a Platinum 4x4 sit on
+   very different price ladders, so after each family fit the comps'
+   residuals are grouped by extracted trim tier (base/mid/premium, from a
+   keyword lexicon at the top of `scoring.py`) and drivetrain (awd vs 2wd),
+   and each group with ≥5 comps gets a shrunk, clamped median offset —
+   sequentially (trim first, then drivetrain on trim-adjusted residuals, so
+   correlated features never double-count). Scoring adds the offsets that
+   apply and divides by the offset-adjusted MAD. **A listing whose trim or
+   drivetrain can't be parsed scores exactly as if the offsets didn't exist**
+   — raw prediction, raw MAD. That dual-MAD rule is load-bearing: dividing an
+   unadjusted residual by the smaller adjusted MAD would inflate |z| and mint
+   false positives on precisely the rows we know least about. Don't
+   "simplify" it away. Alerts show what was applied
+   (`… (F150 · base trim -10% · 2WD -2%)`), and a base-spec listing scored
+   without a matching offset is flagged — its discount may read high.
+
+   To edit the lexicon (add a trim token, fix a tier): change the lists at
+   the top of `scoring.py`, bump `TRIM_LEXICON_VERSION`, restart — the
+   migration re-extracts every stored row, and the next refit relearns the
+   offsets. Tiers are buckets, not strict ordinals: what matters is that a
+   token lands in the same bucket consistently within a family.
 4. **Confidence gates** — no alert at all when the model can't be trusted:
    fewer than 8 comps, degenerate or absurd residual spread, the listing's km
    or age outside the fitted comps' range (no extrapolating depreciation

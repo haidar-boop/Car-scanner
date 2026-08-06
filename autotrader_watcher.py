@@ -329,11 +329,19 @@ def parse_listings(page_props, search_label):
             year = vehicle.get("modelYear")
             make = vehicle.get("make")
             model = vehicle.get("model")
+            mv = vehicle.get("modelVersionInput")
+            title = " ".join(str(x) for x in (year, make, model) if x)
+            description = strip_html(l.get("description"))
+            # title=None on purpose: the synthesized "year make model" can
+            # only ever match model-name tokens (a Lexus LS is not an LS
+            # trim) — pure noise as a trim source.
+            trim_tier, drivetrain = scoring.extract_features(
+                make, mv, None, description)
             rows.append({
                 "id": str(listing_id),
                 "source": "autotrader",
                 "url": l.get("url"),
-                "title": " ".join(str(x) for x in (year, make, model) if x),
+                "title": title,
                 "price": price,
                 "year": year,
                 "make": make,
@@ -342,12 +350,15 @@ def parse_listings(page_props, search_label):
                 "seller_type": seller.get("type"),
                 "city": location.get("city"),
                 "distance_km": location.get("distanceToSearchLocationInKm"),
-                "description": strip_html(l.get("description")),
+                "description": description,
                 "is_damaged": 1 if vehicle.get("isCurrentlyDamaged") else 0,
                 "result_type": l.get("searchResultType"),
                 "price_label": (l.get("tracking") or {}).get("priceLabel"),
                 "search_label": search_label,
                 "raw_json": json.dumps(l),
+                "trim_tier": trim_tier,
+                "drivetrain": drivetrain,
+                "model_version": (str(mv)[:200] if mv else None),
             })
         except Exception as e:
             log("skipping malformed listing: %s" % e)
@@ -421,6 +432,20 @@ STEP2_COLUMNS = {
     "km_converted_from_miles": "INTEGER",
 }
 
+# Trim/drivetrain awareness (see scoring.py lexicon).
+STEP6_LISTING_COLUMNS = {
+    "trim_tier": "INTEGER",      # 0 base / 1 mid / 2 premium / NULL unknown
+    "drivetrain": "TEXT",        # 'awd' | 'fwd' | NULL
+    "model_version": "TEXT",     # raw vehicle.modelVersionInput, for audit
+}
+STEP6_MODEL_COLUMNS = {
+    "offsets_json": "TEXT",      # {'trim': {tier: {off,n}}, 'drivetrain': ...}
+    "mad_adj": "REAL",           # MAD after offsets explained their variance
+}
+STEP6_ALERT_COLUMNS = {
+    "adjustments": "TEXT",       # JSON snapshot of offsets applied at firing
+}
+
 STEP2_DDL = """
 CREATE INDEX IF NOT EXISTS idx_listings_family ON listings(family);
 CREATE INDEX IF NOT EXISTS idx_listings_fp     ON listings(fingerprint);
@@ -484,6 +509,15 @@ def migrate_db(conn):
                 conn.execute("ALTER TABLE listings ADD COLUMN %s %s" % (name, decl))
     conn.executescript(STEP2_DDL)
     conn.commit()
+    for table, decls in (("listings", STEP6_LISTING_COLUMNS),
+                         ("models", STEP6_MODEL_COLUMNS),
+                         ("alerts", STEP6_ALERT_COLUMNS)):
+        have = {r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)}
+        with conn:
+            for name, decl in decls.items():
+                if name not in have:
+                    conn.execute("ALTER TABLE %s ADD COLUMN %s %s"
+                                 % (table, name, decl))
 
     todo = conn.execute(
         "SELECT * FROM listings WHERE family IS NULL AND reject_reason IS NULL"
@@ -499,6 +533,53 @@ def migrate_db(conn):
                     (family, fp, reason, r["source"], r["id"]),
                 )
         log("migration: backfilled %d rows" % len(todo))
+
+    # Versioned trim/drivetrain extraction: runs once per lexicon version and
+    # OVERWRITES existing values — that is what makes editing the lexicon and
+    # bumping TRIM_LEXICON_VERSION re-classify history.
+    if meta_get(conn, "trim_lexicon_v") != str(scoring.TRIM_LEXICON_VERSION):
+        n = failed = 0
+        rows = conn.execute(
+            "SELECT source, id, make, model, title, description, raw_json"
+            " FROM listings").fetchall()
+        with conn:
+            for r in rows:
+                # One malformed historical row must never crash-loop the
+                # watcher at startup — skip it, keep migrating.
+                try:
+                    mv, title = None, r["title"]
+                    if r["raw_json"]:
+                        try:
+                            raw = json.loads(r["raw_json"])
+                        except (ValueError, TypeError):
+                            raw = {}
+                        if r["source"] == "autotrader":
+                            mv = (raw.get("vehicle") or {}).get("modelVersionInput")
+                            title = None  # synthesized "year make model": noise
+                        else:
+                            # FB stores only text[:200] as title; the full
+                            # scraped text (what live extraction saw) is in
+                            # raw_json — a version bump must not degrade
+                            # rows whose tokens sit past char 200.
+                            title = raw.get("text") or r["title"]
+                    exclude = ()
+                    if r["source"] == "facebook" and r["model"]:
+                        exclude = (r["model"],)
+                    tier, dt = scoring.extract_features(
+                        r["make"], mv, title, r["description"],
+                        exclude_tokens=exclude)
+                    conn.execute(
+                        "UPDATE listings SET trim_tier=?, drivetrain=?,"
+                        " model_version=? WHERE source=? AND id=?",
+                        (tier, dt, (str(mv)[:200] if mv else None),
+                         r["source"], r["id"]))
+                    n += 1
+                except Exception:
+                    failed += 1
+        meta_set(conn, "trim_lexicon_v", str(scoring.TRIM_LEXICON_VERSION))
+        log("migration: extracted trim/drivetrain for %d rows (lexicon v%d%s)"
+            % (n, scoring.TRIM_LEXICON_VERSION,
+               ", %d skipped" % failed if failed else ""))
 
 
 def store_listings(conn, rows):
@@ -523,13 +604,16 @@ def store_listings(conn, rows):
                         seller_type, city, distance_km, description, is_damaged,
                         result_type, price_label, search_label,
                         first_seen_at, last_seen_at, raw_json,
-                        km_converted_from_miles)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        km_converted_from_miles, trim_tier, drivetrain,
+                        model_version)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (r["id"], r["source"], r["url"], r["title"], r["price"],
                      r["year"], r["make"], r["model"], r["km"], r["seller_type"],
                      r["city"], r["distance_km"], r["description"], r["is_damaged"],
                      r["result_type"], r["price_label"], r["search_label"],
-                     now, now, r["raw_json"], r.get("km_converted_from_miles")),
+                     now, now, r["raw_json"], r.get("km_converted_from_miles"),
+                     r.get("trim_tier"), r.get("drivetrain"),
+                     r.get("model_version")),
                 )
                 conn.execute(
                     "INSERT INTO price_history (source, id, price, seen_at)"
@@ -552,10 +636,12 @@ def store_listings(conn, rows):
                     conn.execute(
                         "UPDATE listings SET last_seen_at=?, price=?, raw_json=?,"
                         " family=?, fingerprint=?, reject_reason=?,"
+                        " trim_tier=?, drivetrain=?, model_version=?,"
                         " z=NULL, pct_below=NULL, scored_at=NULL"
                         " WHERE source=? AND id=?",
                         (now, r["price"], r["raw_json"], family, fp, reason,
-                         r["source"], r["id"]),
+                         r.get("trim_tier"), r.get("drivetrain"),
+                         r.get("model_version"), r["source"], r["id"]),
                     )
                 else:
                     conn.execute(
@@ -616,11 +702,18 @@ def format_alert(row, score, predicted_price, shadow, first_seen_at=None):
         round(score["pct_below"]), score["z"],
         format(row["price"], ","), vehicle_line(row),
     )
+    adj_labels = {"awd": "4x4/AWD", "fwd": "2WD"}
+    adj_bits = "".join(
+        " · %s %+.0f%%" % (
+            scoring.TRIM_TIER_NAMES.get(level, level) if feature == "trim"
+            else adj_labels.get(level, level),
+            (math.exp(delta) - 1) * 100)
+        for feature, level, delta in score.get("adjustments") or [])
     lines = [
         head,
-        "predicted $%s from %d comps (%s)" % (
+        "predicted $%s from %d comps (%s%s)" % (
             format(predicted_price, ","), score["model"]["comp_count"],
-            score["model"]["model_key"].split(":", 1)[-1]),
+            score["model"]["model_key"].split(":", 1)[-1], adj_bits),
         "%s · %s · %s · %s" % (
             km, row.get("seller_type") or "seller n/a",
             row.get("city") or "city n/a", format_age(minutes_since(first_seen_at))),
@@ -630,6 +723,10 @@ def format_alert(row, score, predicted_price, shadow, first_seen_at=None):
         marks.append("⚠️ LOW CONFIDENCE — segment model, too few comps for this family")
     if row.get("seller_type") == "Dealer":
         marks.append("🏪 DEALER — priced by a pro, check for a catch")
+    if score.get("unpriced_features"):
+        marks.append("⚠️ %s listing, curve not adjusted (few same-spec comps)"
+                     " — discount may read high"
+                     % "/".join(score["unpriced_features"]))
     if marks:
         lines.append(" · ".join(marks))
     lines.append(row.get("url") or "")   # URL last so it stays tappable
@@ -760,14 +857,18 @@ def get_model_for(conn, family, search_label):
         "SELECT * FROM models WHERE model_key=?", ("family:%s" % family,)
     ).fetchone()
     if row and row["comp_count"] >= scoring.FAMILY_MODEL_MIN_COMPS:
-        return dict(row), False
+        d = dict(row)
+        d["offsets"] = scoring.unpack_offsets(d.get("offsets_json"))
+        return d, False
     segment = scoring.SEGMENT_MAP.get(search_label)
     if segment:
         row = conn.execute(
             "SELECT * FROM models WHERE model_key=?", ("segment:%s" % segment,)
         ).fetchone()
         if row:
-            return dict(row), True
+            d = dict(row)
+            d["offsets"] = scoring.unpack_offsets(d.get("offsets_json"))
+            return d, True
     return None
 
 
@@ -777,10 +878,28 @@ def score_listing(conn, row):
         return None
     model_row, low_confidence = picked
     age = scoring.age_of(row["year"])
-    z, pct_below = scoring.robust_z(row["price"], model_row, age, row["km"])
+    tier, drivetrain = row.get("trim_tier"), row.get("drivetrain")
+    z, pct_below = scoring.robust_z(row["price"], model_row, age, row["km"],
+                                    tier, drivetrain)
+    adjustments = scoring.applicable_offsets(model_row, tier, drivetrain)
+    predicted = int(round(math.exp(
+        scoring.predict_log_price(model_row, age, row["km"])
+        + sum(a[2] for a in adjustments))))
+    # Known-but-unadjusted features matter only in the false-positive
+    # direction: a base-spec / 2WD listing scored against the blended curve
+    # reads cheaper than it is. (Premium/awd unadjusted reads expensive —
+    # conservative — so no flag.)
+    offsets = model_row.get("offsets") or {}
+    unpriced = []
+    if tier == 0 and 0 not in (offsets.get("trim") or {}):
+        unpriced.append("base trim")
+    if drivetrain == "fwd" and "fwd" not in (offsets.get("drivetrain") or {}):
+        unpriced.append("2WD")
     suppress = scoring.gate(model_row, age, row["km"], utc_now_iso(), model_row["kind"])
     return {"z": z, "pct_below": pct_below, "model": model_row,
-            "low_confidence": low_confidence, "suppress": suppress}
+            "low_confidence": low_confidence, "suppress": suppress,
+            "adjustments": adjustments, "predicted_price": predicted,
+            "unpriced_features": unpriced}
 
 
 def maybe_alert(conn, row, score):
@@ -809,8 +928,9 @@ def maybe_alert(conn, row, score):
             z=round(score["z"], 2), reason="repost_fingerprint")
         return
     m = score["model"]
-    age = scoring.age_of(row["year"])
-    predicted = int(round(math.exp(scoring.predict_log_price(m, age, row["km"]))))
+    # The displayed prediction must be the one the z was computed against —
+    # score_listing already folded the trim/drivetrain offsets in.
+    predicted = score["predicted_price"]
     now = utc_now_iso()
     shadow_until = meta_get(conn, "shadow_until") or ""
     shadow = 1 if now < shadow_until else 0
@@ -819,12 +939,13 @@ def maybe_alert(conn, row, score):
             cur = conn.execute(
                 """INSERT INTO alerts (source, listing_id, fired_at, z, pct_below,
                        price, predicted_price, model_key, b0, b1, b2, mad,
-                       comp_count, is_dealer, low_confidence, shadow)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       comp_count, is_dealer, low_confidence, shadow, adjustments)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (src, lid, now, score["z"], score["pct_below"], row["price"],
                  predicted, m["model_key"], m["b0"], m["b1"], m["b2"], m["mad"],
                  m["comp_count"], 1 if row.get("seller_type") == "Dealer" else 0,
-                 1 if score["low_confidence"] else 0, shadow),
+                 1 if score["low_confidence"] else 0, shadow,
+                 json.dumps(score["adjustments"])),
             )
     except sqlite3.IntegrityError:
         log("[suppress] %s/%s: already alerted" % (src, lid))
@@ -836,7 +957,8 @@ def maybe_alert(conn, row, score):
         z=round(score["z"], 2), pct_below=round(score["pct_below"], 1),
         price=row["price"], predicted=predicted, shadow=bool(shadow),
         model_key=m["model_key"], comps=m["comp_count"],
-        low_confidence=bool(score["low_confidence"]))
+        low_confidence=bool(score["low_confidence"]),
+        adjustments=len(score["adjustments"]))
     if not shadow:
         seen_row = conn.execute(
             "SELECT first_seen_at FROM listings WHERE source=? AND id=?",
@@ -1648,6 +1770,35 @@ def run_test():
         ):
             print("    %-28s n=%-4d mad=%.3f  %s" % (
                 m["model_key"], m["comp_count"], m["mad"], m["method"]))
+        with_off = conn.execute(
+            "SELECT * FROM models WHERE kind='family'"
+            " AND COALESCE(offsets_json,'{}') NOT IN ('','{}')"
+            " ORDER BY comp_count DESC").fetchall()
+        print("  offsets: %d of %d family models carry trim/drivetrain offsets"
+              % (len(with_off), fams))
+        if with_off:
+            m = with_off[0]
+            offs = scoring.unpack_offsets(m["offsets_json"])
+            bits = []
+            for tier, v in sorted((offs.get("trim") or {}).items()):
+                bits.append("trim%d %+.0f%% (n=%d)"
+                            % (tier, (math.exp(v["off"]) - 1) * 100, v["n"]))
+            for dt, v in sorted((offs.get("drivetrain") or {}).items()):
+                bits.append("%s %+.0f%% (n=%d)"
+                            % (dt, (math.exp(v["off"]) - 1) * 100, v["n"]))
+            print("    %s: %s, mad %.3f->%.3f" % (
+                m["model_key"], " · ".join(bits), m["mad"],
+                m["mad_adj"] if m["mad_adj"] else m["mad"]))
+        cov = conn.execute(
+            """SELECT COUNT(*) AS n,
+                      SUM(trim_tier IS NOT NULL) AS t,
+                      SUM(drivetrain IS NOT NULL) AS d
+               FROM listings WHERE reject_reason IS NULL
+                 AND source='autotrader'""").fetchone()
+        if cov["n"]:
+            print("  extraction coverage (clean AT rows): trim %d%%, drivetrain %d%%"
+                  % (100 * (cov["t"] or 0) // cov["n"],
+                     100 * (cov["d"] or 0) // cov["n"]))
 
         print("\n--- 4. TOP SCORED LISTINGS ---------------------------------------")
         # rescore everything fetched now that models exist
