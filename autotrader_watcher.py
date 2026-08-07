@@ -87,6 +87,16 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
+# Many hosting/cloud ASNs (this includes most VPS providers) get a blanket
+# 403 from AutoTrader's WAF regardless of headers — confirmed live: a bare
+# datacenter IP got a static CloudFront/S3 "This page isn't available to
+# you" error page, not a JS challenge, so no amount of header tweaking fixes
+# it. AUTOTRADER_PROXY_URL routes fetch_page() through a residential proxy
+# instead; standard `user:pass@host:port` proxy URL format. Unset = today's
+# direct-connection behavior (fine from a non-datacenter IP).
+AUTOTRADER_PROXY_URL = os.environ.get("AUTOTRADER_PROXY_URL", "")
+AUTOTRADER_PROXIES = ({"http": AUTOTRADER_PROXY_URL, "https": AUTOTRADER_PROXY_URL}
+                      if AUTOTRADER_PROXY_URL else None)
 
 DB_PATH = os.environ.get(
     "CAR_SCANNER_DB",
@@ -249,7 +259,8 @@ def fetch_page(url):
     problem = "unreachable"
     for attempt in range(1, FETCH_RETRIES + 1):
         try:
-            resp = requests.get(url, headers=headers, timeout=FETCH_TIMEOUT_S)
+            resp = requests.get(url, headers=headers, timeout=FETCH_TIMEOUT_S,
+                                proxies=AUTOTRADER_PROXIES)
             challenge = detect_bot_challenge(resp)
             if resp.status_code == 200 and not challenge:
                 return resp.text, None
@@ -1970,8 +1981,11 @@ def recheck_listings(conn):
     ).fetchall()
     for r in rows:
         try:
+            # Same WAF as the search pages: without the proxy every probe
+            # 403s into 'unknown' and lifespan tracking silently never works.
             resp = requests.get(
                 r["url"], timeout=FETCH_TIMEOUT_S, allow_redirects=True,
+                proxies=AUTOTRADER_PROXIES,
                 headers={"User-Agent": USER_AGENT, "Accept-Language": "en-CA,en;q=0.9"})
             verdict = classify_listing_check(resp, r["id"])
         except requests.RequestException:

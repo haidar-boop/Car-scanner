@@ -316,6 +316,22 @@ sort). If the alarm mentions a bot wall, curl the search URL from the
 droplet: a challenge page means the IP is blocked, and the fix is a
 different IP or a slower cadence, not a parser change.
 
+**Every AutoTrader fetch 403s from the droplet.** Confirmed live: the WAF
+blanket-blocks hosting/VPS IP ranges (DigitalOcean included) with a static
+"This page isn't available to you" page — it's the IP range, not the
+headers, so no parser or header change helps. Fix: a **rotating
+residential proxy**. Sign up with any pay-per-GB residential proxy
+provider, take the `http://username:password@gateway:port` URL from its
+dashboard, and set it as `AUTOTRADER_PROXY_URL` in `/etc/car-scanner.env`,
+then restart the service. Only AutoTrader traffic (searches + lifespan
+re-checks) uses the proxy — Telegram, the FB ingest bridge, and the AI
+calls never touch it. Bandwidth at the default cadence: each search page
+is ~145 KB on the wire, 3 pages every 5–9 min ≈ 2.7 GB/month, plus
+lifespan re-checks once the database matures ≈ 3–5 GB/month total — aim
+for a plan around that. If a proxy fetch fails, the normal retry/alarm
+machinery treats it like any other fetch failure; lifespan probes
+classify errors as 'unknown', never as 'sold'.
+
 **Alerts went quiet.** Check the digest first — if scan counts look normal
 and rejections are unremarkable, the market is genuinely quiet. If
 `VOLUME DROP` fired, one source is degraded while the other masks it.
