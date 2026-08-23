@@ -1,4 +1,4 @@
-# Project pickup — resume here (paused 2026-08-07, resuming ~late August)
+# Project pickup — resume here (paused 2026-08-07, resuming ~2026-08-11)
 
 The build is DONE and fully committed. This file is the map back in.
 
